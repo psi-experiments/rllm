@@ -12,6 +12,7 @@ import torch
 
 from rllm.agents.agent import Episode, Step, Trajectory
 from rllm.engine.rollout import ModelOutput
+from rllm.parser import QwenChatTemplateParser
 from rllm.trainer.algorithms.config import CompactFilteringConfig, TransformConfig
 from rllm.trainer.algorithms.transform import transform_episodes_to_trajectory_groups
 from rllm.trainer.verl.transform import transform_episodes_to_dataproto
@@ -191,6 +192,106 @@ class TestRolloutLogProbsPropagation:
         # Mask follows the same shape: [1, 1, 0, 1, 1, 1]
         response_mask = batch.batch["response_mask"][0]
         assert response_mask[:6].tolist() == [1, 1, 0, 1, 1, 1]
+
+    def test_nonprefix_cumulative_chat_uses_rllm_parser_once(self):
+        """Chat-cumulative Qwen turns become one assistant-masked row.
+
+        A chat template may rewrite historical turns, so the second prompt is
+        not necessarily a literal extension of the first prompt plus
+        completion. The workflow can opt into rLLM's canonical cumulative
+        conversion rather than implementing a recipe-specific mask.
+        """
+        first_messages = [
+            {"role": "system", "content": "Use tools."},
+            {"role": "user", "content": "Solve this."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "execute",
+                            "arguments": '{"code":"result = 1"}',
+                        },
+                    }
+                ],
+            },
+        ]
+        final_messages = first_messages + [
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "execute",
+                "content": "1",
+            },
+            {"role": "assistant", "content": "ANSWER: 1"},
+        ]
+        output_1 = ModelOutput(
+            prompt_ids=[1, 2],
+            completion_ids=[3, 4],
+            logprobs=[-0.1, -0.2],
+        )
+        # Deliberately not prefixed by [1, 2, 3, 4].
+        output_2 = ModelOutput(
+            prompt_ids=[1, 2, 9, 4, 5],
+            completion_ids=[6, 7],
+            logprobs=[-0.3, -0.4],
+        )
+        trajectory = Trajectory(
+            steps=[
+                Step(
+                    chat_completions=first_messages,
+                    model_output=output_1,
+                ),
+                Step(
+                    chat_completions=final_messages,
+                    model_output=output_2,
+                ),
+            ],
+            reward=1.0,
+            metadata={
+                "rllm_cumulative_chat": {
+                    "tools": [{"type": "function", "function": {"name": "execute"}}],
+                }
+            },
+        )
+        episode = Episode(
+            id="task_0:0",
+            trajectories=[trajectory],
+            is_correct=True,
+        )
+        non_qwen_engine = _make_mock_rollout_engine()
+        non_qwen_batch = transform_episodes_to_dataproto(
+            [episode], non_qwen_engine, max_prompt_length=8, max_response_length=8
+        )
+        assert non_qwen_batch.batch["responses"].shape[0] == 2
+        non_qwen_engine.chat_parser.tokenize_and_mask_cumulative.assert_not_called()
+
+        engine = _make_mock_rollout_engine()
+        engine.chat_parser = MagicMock(spec=QwenChatTemplateParser)
+        engine.chat_parser.tokenize_and_mask_cumulative.return_value = (
+            torch.tensor([10, 11]),
+            torch.tensor([12, 13, 14]),
+            torch.tensor([1, 0, 1]),
+        )
+
+        batch = transform_episodes_to_dataproto(
+            [episode],
+            engine,
+            max_prompt_length=8,
+            max_response_length=8,
+        )
+
+        engine.chat_parser.tokenize_and_mask_cumulative.assert_called_once_with(
+            final_messages,
+            tools=[{"type": "function", "function": {"name": "execute"}}],
+        )
+        assert batch.batch["responses"].shape[0] == 1
+        assert batch.batch["responses"][0, :3].tolist() == [12, 13, 14]
+        assert batch.batch["response_mask"][0, :3].tolist() == [1, 0, 1]
+        assert "rollout_log_probs" not in batch.batch
 
     def test_other_batch_fields_unchanged(self):
         """Adding logprobs should not affect existing batch fields."""
