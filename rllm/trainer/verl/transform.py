@@ -9,6 +9,7 @@ from verl.protocol import DataProto
 from verl.utils.torch_functional import pad_sequence_to_length
 
 from rllm.engine.rollout import VerlEngine
+from rllm.parser import QwenChatTemplateParser
 from rllm.trainer.verl.dataclass import AccumulatedData, ProcessedStepData
 from rllm.types import Episode, Trajectory, TrajectoryGroup
 from rllm.workflows.workflow import TerminationReason
@@ -245,7 +246,7 @@ def _decode_routing_matrices(encoded: list[str] | None) -> torch.Tensor | None:
     return torch.from_numpy(arr.copy())
 
 
-def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: AccumulatedData) -> int:
+def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: AccumulatedData, chat_parser=None) -> int:
     """Processes a trajectory and returns an AccumulatedData.
 
     Multi-turn trajectories whose steps form a cumulative-prefix chain
@@ -297,6 +298,12 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
 
     if not valid_steps:
         return 0
+
+    cumulative_config = (trajectory.metadata or {}).get("rllm_cumulative_chat")
+    if cumulative_config is True:
+        cumulative_config = {}
+    if cumulative_config is not None and not isinstance(cumulative_config, dict):
+        raise ValueError("trajectory metadata rllm_cumulative_chat must be true or a mapping")
 
     # ------------------------------------------------------------------
     # Walk steps and merge prefix-extending steps into segments.
@@ -368,6 +375,43 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
             group_role=name,
         )
 
+    def _emit_qwen_cumulative_chat() -> bool:
+        """Use rLLM's chat masker when Qwen re-rendering breaks token prefixes."""
+        if cumulative_config is None or not isinstance(chat_parser, QwenChatTemplateParser):
+            return False
+        if len(valid_steps) != len(trajectory.steps) or not trajectory.is_cumulative():
+            raise ValueError("rllm_cumulative_chat requires a complete cumulative message history")
+
+        final_messages = valid_steps[-1].chat_completions
+        assistant_count = sum(message.get("role") == "assistant" for message in final_messages)
+        if not final_messages or assistant_count != len(valid_steps):
+            raise ValueError("rllm_cumulative_chat requires one generated assistant message per model step")
+
+        prompt, response, mask = chat_parser.tokenize_and_mask_cumulative(final_messages, tools=cumulative_config.get("tools"))
+        if response.numel() == 0 or mask.sum().item() == 0:
+            raise ValueError("rllm cumulative chat conversion produced no assistant tokens")
+
+        accumulated.add_step(
+            step_data=ProcessedStepData(
+                prompt=prompt,
+                response=response,
+                mask=mask,
+                step_reward=traj_reward,
+                step_id=trajectory.uid,
+                multi_modal_inputs={},
+                advantage=None,
+                # Re-tokenization invalidates captured per-token logprobs.
+                logprobs=None,
+                routing_matrices=None,
+            ),
+            trajectory_id=trajectory_id,
+            traj_reward=traj_reward,
+            step_num=1,
+            is_last=True,
+            group_role=name,
+        )
+        return True
+
     seg = _new_segment(valid_steps[0])
     segments_emitted = 0
     for step in valid_steps[1:]:
@@ -392,6 +436,8 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
             if step.routing_matrices is not None:
                 seg["last_routing_step"] = step
         else:
+            if segments_emitted == 0 and _emit_qwen_cumulative_chat():
+                return 1
             # Non-cumulative — close out current segment, start a new one.
             _emit(seg)
             segments_emitted += 1
@@ -402,7 +448,7 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
     return segments_emitted
 
 
-def _process_episode(episode: Episode, task_id: str, accumulated: AccumulatedData) -> int:
+def _process_episode(episode: Episode, task_id: str, accumulated: AccumulatedData, chat_parser=None) -> int:
     """Processes an episode and returns an AccumulatedData.
 
     Args:
@@ -422,7 +468,7 @@ def _process_episode(episode: Episode, task_id: str, accumulated: AccumulatedDat
         return 0
 
     for trajectory in episode.trajectories:
-        n_steps = _process_trajectory(trajectory, task_id, accumulated)
+        n_steps = _process_trajectory(trajectory, task_id, accumulated, chat_parser=chat_parser)
         total_steps += n_steps
 
     # Extend episode-level data for all steps in this episode
@@ -435,11 +481,11 @@ def _process_episode(episode: Episode, task_id: str, accumulated: AccumulatedDat
     return total_steps
 
 
-def _process_trajectory_group(trajectory_group: TrajectoryGroup, task_id: str, accumulated: AccumulatedData) -> int:
+def _process_trajectory_group(trajectory_group: TrajectoryGroup, task_id: str, accumulated: AccumulatedData, chat_parser=None) -> int:
     """Processes a trajectory group and returns an AccumulatedData."""
     total_steps = 0
     for trajectory in trajectory_group.trajectories:
-        n_steps = _process_trajectory(trajectory, task_id, accumulated)
+        n_steps = _process_trajectory(trajectory, task_id, accumulated, chat_parser=chat_parser)
         total_steps += n_steps
 
     # Extend episode-level data for all steps in this trajectory group
@@ -539,7 +585,7 @@ def transform_episodes_to_dataproto(
     for episode in episodes:
         task_id = episode.task_id
         total_agent_steps += sum(len(traj.steps) for traj in episode.trajectories)
-        total_steps = _process_episode(episode, task_id, accumulated)
+        total_steps = _process_episode(episode, task_id, accumulated, chat_parser=rollout_engine.chat_parser)
         accumulated.repeat_counts.append(total_steps)
 
     assert hasattr(tokenizer, "pad_token_id"), "Tokenizer must have a pad token ID"
@@ -565,7 +611,7 @@ def transform_trajectory_groups_to_dataproto(
     accumulated = AccumulatedData()
     for trajectory_group in trajectory_groups:
         task_id = trajectory_group.task_id
-        total_steps = _process_trajectory_group(trajectory_group, task_id, accumulated)
+        total_steps = _process_trajectory_group(trajectory_group, task_id, accumulated, chat_parser=rollout_engine.chat_parser)
         accumulated.repeat_counts.append(total_steps)
 
     assert tokenizer is not None and hasattr(tokenizer, "pad_token_id"), "Tokenizer must have a pad token ID"

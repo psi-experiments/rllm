@@ -150,7 +150,7 @@ class ChatTemplateParser:
 
         return prompt_ids, response_ids, response_mask
 
-    def tokenize_and_mask_cumulative(self, messages):
+    def tokenize_and_mask_cumulative(self, messages, tools=None):
         response_ids = []
         response_mask = []
 
@@ -159,19 +159,19 @@ class ChatTemplateParser:
         except StopIteration:
             raise ValueError("No assistant message found in chat_completions") from None
 
-        prompt = self.parse(messages[:first_assistant_idx], is_first_msg=True, add_generation_prompt=True, accumulate_reasoning=False)
+        prompt = self.parse(messages[:first_assistant_idx], is_first_msg=True, add_generation_prompt=True, accumulate_reasoning=False, tools=tools)
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
 
         for i in range(first_assistant_idx, len(messages)):
             is_asst = messages[i]["role"] == "assistant"
             if is_asst:
-                response = self.parse([messages[i]], is_first_msg=False, add_generation_prompt=False, accumulate_reasoning=True)
+                response = self.parse([messages[i]], is_first_msg=False, add_generation_prompt=False, accumulate_reasoning=True, tools=tools)
                 response = response[len(self.generation_prompt) :]
                 ids = self.tokenizer.encode(response, add_special_tokens=False)
                 response_ids.extend(ids)
                 response_mask.extend([1] * len(ids))
             else:
-                response = self.parse([messages[i]], is_first_msg=False, add_generation_prompt=True, accumulate_reasoning=False)
+                response = self.parse([messages[i]], is_first_msg=False, add_generation_prompt=True, accumulate_reasoning=False, tools=tools)
                 ids = self.tokenizer.encode(response, add_special_tokens=False)
                 response_ids.extend(ids)
                 response_mask.extend([0] * len(ids))
