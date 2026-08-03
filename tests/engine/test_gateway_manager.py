@@ -43,6 +43,74 @@ class TestGatewayStoreValidation:
             GatewayManager(_make_config(store="memory", db_path="/tmp/x.db"), mode="thread")
 
 
+class TestGatewayAbortResume:
+    @staticmethod
+    def _config(
+        *,
+        enabled: bool,
+        partial_rollout: bool,
+        gateway_override=None,
+    ):
+        gateway = {}
+        if gateway_override is not None:
+            gateway["resume_aborted_requests"] = gateway_override
+        return OmegaConf.create(
+            {
+                "model": {"name": "Qwen/Qwen3-8B"},
+                "rllm": {
+                    "gateway": gateway,
+                    "async_training": {
+                        "enable": enabled,
+                        "partial_rollout": partial_rollout,
+                    },
+                },
+                "actor_rollout_ref": {
+                    "rollout": {
+                        "engine_kwargs": {
+                            "vllm": {
+                                "tool_call_parser": "psi_hermes_concurrent",
+                            }
+                        }
+                    }
+                },
+            }
+        )
+
+    def test_enabled_automatically_for_fully_async_partial_rollouts(self):
+        gateway = GatewayManager(
+            self._config(enabled=True, partial_rollout=True),
+            mode="process",
+        )
+        assert gateway.resume_aborted_requests is True
+        assert gateway.abort_resume_tool_parser == "psi_hermes_concurrent"
+
+    @pytest.mark.parametrize(
+        ("enabled", "partial_rollout"),
+        [(False, False), (True, False), (False, True)],
+    )
+    def test_disabled_unless_both_async_switches_are_on(
+        self,
+        enabled,
+        partial_rollout,
+    ):
+        gateway = GatewayManager(
+            self._config(enabled=enabled, partial_rollout=partial_rollout),
+            mode="process",
+        )
+        assert gateway.resume_aborted_requests is False
+
+    def test_explicit_override_can_disable_automatic_resume(self):
+        gateway = GatewayManager(
+            self._config(
+                enabled=True,
+                partial_rollout=True,
+                gateway_override=False,
+            ),
+            mode="process",
+        )
+        assert gateway.resume_aborted_requests is False
+
+
 class TestContainerReachableUrl:
     @pytest.mark.parametrize(
         ("url", "backend", "expected"),

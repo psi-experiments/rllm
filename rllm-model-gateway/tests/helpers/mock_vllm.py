@@ -183,6 +183,7 @@ def build_mock_vllm_app() -> FastAPI:
     """Create a minimal mock vLLM server that returns canned responses."""
     app = FastAPI()
     app.state.request_log: list[dict[str, Any]] = []
+    app.state.response_queue: list[dict[str, Any]] = []
     app.state._log_lock = threading.Lock()
 
     @app.get("/health")
@@ -198,9 +199,12 @@ def build_mock_vllm_app() -> FastAPI:
         body = await request.json()
         with app.state._log_lock:
             app.state.request_log.append(body)
+            queued = app.state.response_queue.pop(0) if app.state.response_queue else None
 
         if body.get("stream"):
             return StreamingResponse(stream_chunks(), media_type="text/event-stream")
+        if queued is not None:
+            return JSONResponse(content=queued)
         return JSONResponse(content=MOCK_RESPONSE)
 
     @app.post("/v1/completions")
@@ -208,6 +212,7 @@ def build_mock_vllm_app() -> FastAPI:
         body = await request.json()
         with app.state._log_lock:
             app.state.request_log.append(body)
+            queued = app.state.response_queue.pop(0) if app.state.response_queue else None
 
         prompt = body.get("prompt", "")
         if isinstance(prompt, list):
@@ -220,6 +225,9 @@ def build_mock_vllm_app() -> FastAPI:
                 completions_stream_chunks(prompt_token_ids),
                 media_type="text/event-stream",
             )
+
+        if queued is not None:
+            return JSONResponse(content=queued)
 
         completion_response = {
             "id": "cmpl-mock",
@@ -338,6 +346,11 @@ class MockVLLMServer:
     @property
     def request_log(self) -> list[dict[str, Any]]:
         return self.app.state.request_log
+
+    def queue_responses(self, *responses: dict[str, Any]) -> None:
+        """Return these responses for subsequent non-streaming requests."""
+        with self.app.state._log_lock:
+            self.app.state.response_queue.extend(responses)
 
     def start(self) -> None:
         if self.port == 0:
