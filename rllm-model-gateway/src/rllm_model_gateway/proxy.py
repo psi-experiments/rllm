@@ -15,6 +15,12 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
+from rllm_model_gateway.abort_resume import (
+    AbortedGeneration,
+    AbortResumeError,
+    TokenDecoder,
+    is_aborted_response,
+)
 from rllm_model_gateway.data_process import (
     build_trace_record,
     build_trace_record_from_chunks,
@@ -87,6 +93,10 @@ class ReverseProxy:
         local_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
         cumulative_token_mode: bool = False,
         renderer: Any = None,
+        resume_aborted_requests: bool = False,
+        abort_resume_tool_parser: str | None = None,
+        token_decoder: TokenDecoder | None = None,
+        abort_resume_delay_s: float = 1.0,
     ) -> None:
         self.router = router
         self.store = store
@@ -96,6 +106,10 @@ class ReverseProxy:
         self.local_handler = local_handler
         self.cumulative_token_mode = cumulative_token_mode
         self.renderer = renderer
+        self.resume_aborted_requests = resume_aborted_requests
+        self.abort_resume_tool_parser = abort_resume_tool_parser
+        self.token_decoder = token_decoder
+        self.abort_resume_delay_s = abort_resume_delay_s
         self.weight_version: int | None = None
         self._http: httpx.AsyncClient | None = None
         self._pending_traces: set[asyncio.Task[None]] = set()
@@ -196,6 +210,7 @@ class ReverseProxy:
         originally_requested_logprobs: bool = False,
     ) -> Response:
         t0 = time.perf_counter()
+        resume_metadata: dict[str, Any] | None = None
 
         if self.local_handler is not None:
             # In-process path: call handler directly, no HTTP
@@ -215,20 +230,38 @@ class ReverseProxy:
                 )
                 content = resp.content
                 status_code = resp.status_code
+                # Parse response for trace extraction before releasing the
+                # selected worker. An interrupted request must continue on
+                # this same worker because it owns the rollout model replica.
+                try:
+                    response_body = json.loads(content)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    response_body = {}
+
+                if self.resume_aborted_requests and status_code < 400 and is_aborted_response(response_body):
+                    response_body, status_code, resume_metadata = await self._resume_aborted_generation(
+                        request=request,
+                        worker_api_url=worker.api_url,
+                        headers=headers,
+                        request_body=request_body,
+                        first_response=response_body,
+                        session_id=session_id,
+                    )
             finally:
                 self.router.release(worker.url)
-
-            # Parse response for trace extraction
-            try:
-                response_body = json.loads(content)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                response_body = {}
 
         latency_ms = (time.perf_counter() - t0) * 1000
 
         # Persist trace
         if session_id and response_body:
-            trace = build_trace_record(session_id, request_body, response_body, latency_ms, weight_version=request.state.weight_version)
+            trace = build_trace_record(
+                session_id,
+                request_body,
+                response_body,
+                latency_ms,
+                metadata=resume_metadata,
+                weight_version=request.state.weight_version,
+            )
             await self._persist(trace)
 
             # Ingest first turn into accumulator for cumulative token mode
@@ -257,6 +290,77 @@ class ReverseProxy:
             status_code=status_code,
             media_type="application/json",
         )
+
+    async def _resume_aborted_generation(
+        self,
+        *,
+        request: Request,
+        worker_api_url: str,
+        headers: dict[str, str],
+        request_body: dict[str, Any],
+        first_response: dict[str, Any],
+        session_id: str | None,
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        """Finish one aborted model turn without exposing partial output.
+
+        Tool execution happens after this HTTP request returns to the agent,
+        so this loop can never replay an MCP/simulator call.
+        """
+        if self.token_decoder is None:
+            error = AbortResumeError("resume_aborted_requests=True requires a model token decoder")
+            return self._abort_resume_error(error), 502, {"interruption_count": 1}
+
+        try:
+            generation = AbortedGeneration(
+                request_body,
+                first_response,
+                decoder=self.token_decoder,
+                tool_parser=self.abort_resume_tool_parser,
+            )
+            continuation_url = self._build_url(
+                worker_api_url,
+                "/v1/completions",
+                "",
+            )
+            while generation.should_resume:
+                logger.info(
+                    "Resuming interrupted model turn for session %s (%d saved tokens)",
+                    session_id,
+                    len(generation.completion_token_ids),
+                )
+                await asyncio.sleep(self.abort_resume_delay_s)
+                continuation_body = generation.continuation_body()
+                resp = await self._send_with_retry(
+                    method=request.method,
+                    url=continuation_url,
+                    content=json.dumps(continuation_body).encode("utf-8"),
+                    headers=headers,
+                )
+                if resp.status_code >= 400:
+                    raise AbortResumeError(f"vLLM returned HTTP {resp.status_code} while resuming an interrupted generation")
+                try:
+                    segment = resp.json()
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise AbortResumeError("vLLM returned invalid JSON while resuming an interrupted generation") from exc
+                generation.append(segment)
+
+            return (
+                generation.merged_response(),
+                200,
+                {"interruption_count": generation.interruption_count},
+            )
+        except AbortResumeError as exc:
+            logger.error("Could not resume interrupted model turn: %s", exc)
+            return self._abort_resume_error(exc), 502, {"interruption_count": 1}
+
+    @staticmethod
+    def _abort_resume_error(error: AbortResumeError) -> dict[str, Any]:
+        return {
+            "error": {
+                "message": str(error),
+                "type": "rllm_abort_resume_error",
+            }
+        }
 
     # ------------------------------------------------------------------
     # Cumulative token mode

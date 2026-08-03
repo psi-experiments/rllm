@@ -165,6 +165,9 @@ gateway:
                          # path, you must set this explicitly (e.g. qwen3, qwen3.5, qwen3.6, glm-5, 
                          # deepseek-v3, gpt-oss). Check supported model families in MODEL_RENDERER_MAP of 
                          # https://github.com/PrimeIntellect-ai/renderers/blob/main/renderers/base.py
+  resume_aborted_requests: null  # null: automatically enable when fully async partial rollouts are on.
+                                 # Only model generation is resumed; tool/simulator calls are never replayed.
+  abort_resume_tool_parser: null # null: inherit the vLLM tool_call_parser configured for the rollout.
 
 # Async Training Configuration
 async_training:

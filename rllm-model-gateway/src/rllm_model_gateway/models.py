@@ -126,3 +126,7 @@ class GatewayConfig(BaseModel):
     # renderers family for the cumulative-mode bridge. Check supported model families
     # in MODEL_RENDERER_MAP of https://github.com/PrimeIntellect-ai/renderers/blob/main/renderers/base.py
     renderer_family: str = "auto"
+    # Fully async VERL can abort a live vLLM request during weight sync. Resume
+    # that same model turn from its raw token IDs before returning to the agent.
+    resume_aborted_requests: bool = False
+    abort_resume_tool_parser: str | None = None

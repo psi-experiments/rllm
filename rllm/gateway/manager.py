@@ -169,6 +169,18 @@ class GatewayManager:
         self.cumulative_token_mode: bool = gw_cfg.get("cumulative_token_mode", False)
         self.renderer_family: str = gw_cfg.get("renderer_family", "auto")
 
+        # AgentFlow model calls go through this OpenAI-compatible gateway and
+        # therefore bypass VERL's direct FullyAsyncLLMServerClient. Mirror its
+        # partial-rollout behavior here whenever fully async interruption is on.
+        async_cfg = config.rllm.get("async_training", {})
+        auto_resume = bool(async_cfg.get("enable", False) and async_cfg.get("partial_rollout", False))
+        configured_resume = gw_cfg.get("resume_aborted_requests", None)
+        self.resume_aborted_requests: bool = auto_resume if configured_resume is None else bool(configured_resume)
+        rollout_cfg = config.get("actor_rollout_ref", {}).get("rollout", {})
+        vllm_engine_kwargs = rollout_cfg.get("engine_kwargs", {}).get("vllm", {})
+        configured_tool_parser = gw_cfg.get("abort_resume_tool_parser", None)
+        self.abort_resume_tool_parser: str | None = configured_tool_parser if configured_tool_parser is not None else vllm_engine_kwargs.get("tool_call_parser", None)
+
         self.mode = mode
 
         self._process: subprocess.Popen | None = None
@@ -361,6 +373,15 @@ class GatewayManager:
             cmd.append("--cumulative-token-mode")
             if self.renderer_family != "auto":
                 cmd.extend(["--renderer-family", self.renderer_family])
+        if self.resume_aborted_requests:
+            cmd.append("--resume-aborted-requests")
+            if self.abort_resume_tool_parser:
+                cmd.extend(
+                    [
+                        "--abort-resume-tool-parser",
+                        self.abort_resume_tool_parser,
+                    ]
+                )
 
         logger.info("Starting gateway subprocess: %s", " ".join(cmd))
         # Inherit parent's stdout/stderr so gateway logs are visible for debugging.
@@ -400,6 +421,8 @@ class GatewayManager:
             add_return_token_ids=self.add_return_token_ids,
             cumulative_token_mode=self.cumulative_token_mode,
             renderer_family=self.renderer_family,
+            resume_aborted_requests=(self.resume_aborted_requests and local_handler is None),
+            abort_resume_tool_parser=self.abort_resume_tool_parser,
         )
         app = create_app(config=gw_config, local_handler=local_handler)
 
