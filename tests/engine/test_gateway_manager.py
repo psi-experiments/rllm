@@ -65,6 +65,9 @@ class TestGatewayAbortResume:
                     },
                 },
                 "actor_rollout_ref": {
+                    "model": {
+                        "path": "/models/hf/hub/models--Qwen--Qwen3-8B/snapshots/exact",
+                    },
                     "rollout": {
                         "engine_kwargs": {
                             "vllm": {
@@ -83,6 +86,14 @@ class TestGatewayAbortResume:
         )
         assert gateway.resume_aborted_requests is True
         assert gateway.abort_resume_tool_parser == "psi_hermes_concurrent"
+        assert gateway.model == "Qwen/Qwen3-8B"
+        assert gateway.tokenizer_path.endswith("/snapshots/exact")
+
+    def test_explicit_tokenizer_path_overrides_actor_model_path(self):
+        config = self._config(enabled=True, partial_rollout=True)
+        config.rllm.gateway.tokenizer_path = "/models/tokenizer-only"
+        gateway = GatewayManager(config, mode="process")
+        assert gateway.tokenizer_path == "/models/tokenizer-only"
 
     @pytest.mark.parametrize(
         ("enabled", "partial_rollout"),

@@ -70,6 +70,11 @@ class AccumulatedData:
     # Each entry is shape (response_len, num_layers, topk).
     routing_matrices: list[torch.Tensor] = field(default_factory=list)
 
+    # Exact Qwen cumulative-chat rows clipped to the declared trainer context.
+    # These counters are batch-level diagnostics, not parallel per-row lists.
+    context_clipped_rows: int = 0
+    context_clipped_tokens: int = 0
+
     def add_step(
         self,
         step_data: ProcessedStepData,

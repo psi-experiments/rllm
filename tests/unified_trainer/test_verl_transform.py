@@ -8,6 +8,7 @@ so that downstream importance sampling and bypass mode work.
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from rllm.agents.agent import Episode, Step, Trajectory
@@ -15,7 +16,11 @@ from rllm.engine.rollout import ModelOutput
 from rllm.parser import QwenChatTemplateParser
 from rllm.trainer.algorithms.config import CompactFilteringConfig, TransformConfig
 from rllm.trainer.algorithms.transform import transform_episodes_to_trajectory_groups
-from rllm.trainer.verl.transform import transform_episodes_to_dataproto
+from rllm.trainer.verl.dataclass import AccumulatedData
+from rllm.trainer.verl.transform import (
+    _batch_tensors_and_build_data_proto,
+    transform_episodes_to_dataproto,
+)
 from rllm.workflows.workflow import TerminationReason
 
 
@@ -254,6 +259,7 @@ class TestRolloutLogProbsPropagation:
             metadata={
                 "rllm_cumulative_chat": {
                     "tools": [{"type": "function", "function": {"name": "execute"}}],
+                    "max_total_length": 8,
                 }
             },
         )
@@ -264,7 +270,11 @@ class TestRolloutLogProbsPropagation:
         )
         non_qwen_engine = _make_mock_rollout_engine()
         non_qwen_batch = transform_episodes_to_dataproto(
-            [episode], non_qwen_engine, max_prompt_length=8, max_response_length=8
+            [episode],
+            non_qwen_engine,
+            max_prompt_length=8,
+            max_response_length=8,
+            max_total_length=8,
         )
         assert non_qwen_batch.batch["responses"].shape[0] == 2
         non_qwen_engine.chat_parser.tokenize_and_mask_cumulative.assert_not_called()
@@ -282,6 +292,7 @@ class TestRolloutLogProbsPropagation:
             engine,
             max_prompt_length=8,
             max_response_length=8,
+            max_total_length=8,
         )
 
         engine.chat_parser.tokenize_and_mask_cumulative.assert_called_once_with(
@@ -292,6 +303,214 @@ class TestRolloutLogProbsPropagation:
         assert batch.batch["responses"][0, :3].tolist() == [12, 13, 14]
         assert batch.batch["response_mask"][0, :3].tolist() == [1, 0, 1]
         assert "rollout_log_probs" not in batch.batch
+
+    def test_qwen_cumulative_chat_is_forced_even_when_raw_tokens_are_prefix_cumulative(self):
+        """Opt-in Qwen traces always use one canonical rendering path."""
+
+        first_messages = [
+            {"role": "user", "content": "solve"},
+            {"role": "assistant", "content": "searching"},
+        ]
+        final_messages = first_messages + [
+            {"role": "tool", "content": "result"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        trajectory = Trajectory(
+            steps=[
+                Step(
+                    chat_completions=first_messages,
+                    model_output=ModelOutput(
+                        prompt_ids=[1, 2],
+                        completion_ids=[3, 4],
+                    ),
+                ),
+                Step(
+                    chat_completions=final_messages,
+                    # This really is a literal extension of prompt+completion.
+                    model_output=ModelOutput(
+                        prompt_ids=[1, 2, 3, 4, 5],
+                        completion_ids=[6],
+                    ),
+                ),
+            ],
+            reward=1.0,
+            metadata={
+                "rllm_cumulative_chat": {
+                    "tools": [],
+                    "max_total_length": 8,
+                }
+            },
+        )
+        episode = Episode(id="task_0:0", trajectories=[trajectory], is_correct=True)
+        engine = _make_mock_rollout_engine()
+        engine.chat_parser = MagicMock(spec=QwenChatTemplateParser)
+        engine.chat_parser.tokenize_and_mask_cumulative.return_value = (
+            torch.tensor([10, 11]),
+            torch.tensor([12, 13, 14]),
+            torch.tensor([1, 0, 1]),
+        )
+
+        batch = transform_episodes_to_dataproto(
+            [episode],
+            engine,
+            max_prompt_length=8,
+            max_response_length=8,
+            max_total_length=8,
+        )
+
+        engine.chat_parser.tokenize_and_mask_cumulative.assert_called_once_with(
+            final_messages,
+            tools=[],
+        )
+        assert batch.batch["responses"][0, :3].tolist() == [12, 13, 14]
+
+    def test_qwen_structured_expansion_is_clipped_to_exact_total_cap(self):
+        """Regression: sampled 32,760 + 8 can canonicalize eight tokens larger."""
+
+        final_messages = [
+            {"role": "user", "content": "solve"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": '{"query":"qutip"}',
+                        },
+                    }
+                ],
+            },
+        ]
+        # vLLM saw a 32,760-token prompt and accepted an 8-token sample.
+        # rLLM's structured reserialization below is 8 tokens larger overall.
+        sampled_prompt = list(range(32_760))
+        trajectory = Trajectory(
+            steps=[
+                Step(
+                    chat_completions=final_messages,
+                    model_output=ModelOutput(
+                        prompt_ids=sampled_prompt,
+                        completion_ids=list(range(8)),
+                    ),
+                )
+            ],
+            reward=0.0,
+            metadata={
+                "rllm_cumulative_chat": {
+                    "tools": [{"type": "function", "function": {"name": "search"}}],
+                    "max_total_length": 32_768,
+                }
+            },
+        )
+        episode = Episode(id="task_0:0", trajectories=[trajectory])
+        engine = _make_mock_rollout_engine()
+        engine.chat_parser = MagicMock(spec=QwenChatTemplateParser)
+        canonical_prompt = torch.arange(100) + 1
+        canonical_response = torch.arange(32_676) + 1_000
+        canonical_mask = torch.ones(32_676, dtype=torch.long)
+        engine.chat_parser.tokenize_and_mask_cumulative.return_value = (
+            canonical_prompt,
+            canonical_response,
+            canonical_mask,
+        )
+
+        batch = transform_episodes_to_dataproto(
+            [episode],
+            engine,
+            max_prompt_length=28_672,
+            max_response_length=32_768,
+            max_total_length=32_768,
+        )
+
+        assert int(batch.batch["attention_mask"].sum().item()) == 32_768
+        assert torch.equal(
+            batch.batch["responses"][0, :32_668],
+            canonical_response[:32_668],
+        )
+        assert int(batch.batch["response_mask"].sum().item()) == 32_668
+        metrics = batch.meta_info["merge_metrics"]
+        assert metrics["batch/context_clipped_rows"] == 1
+        assert metrics["batch/context_clipped_tokens"] == 8
+
+    def test_declared_qwen_cap_can_be_stricter_than_backend_cap(self):
+        messages = [
+            {"role": "user", "content": "solve"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        trajectory = Trajectory(
+            steps=[
+                Step(
+                    chat_completions=messages,
+                    model_output=ModelOutput(prompt_ids=[1], completion_ids=[2]),
+                )
+            ],
+            metadata={
+                "rllm_cumulative_chat": {
+                    "tools": [],
+                    "max_total_length": 6,
+                }
+            },
+        )
+        engine = _make_mock_rollout_engine()
+        engine.chat_parser = MagicMock(spec=QwenChatTemplateParser)
+        engine.chat_parser.tokenize_and_mask_cumulative.return_value = (
+            torch.tensor([1, 2]),
+            torch.tensor([3, 4, 5, 6, 7]),
+            torch.tensor([1, 1, 1, 1, 1]),
+        )
+
+        batch = transform_episodes_to_dataproto(
+            [Episode(id="task:0", trajectories=[trajectory])],
+            engine,
+            max_prompt_length=8,
+            max_response_length=8,
+            max_total_length=8,
+        )
+
+        assert batch.batch["responses"][0, :4].tolist() == [3, 4, 5, 6]
+        assert batch.meta_info["merge_metrics"]["batch/context_clipped_tokens"] == 1
+
+    def test_batch_rejects_prompt_or_mask_truncation_instead_of_hiding_it(self):
+        accumulated = AccumulatedData(
+            prompts=[torch.tensor([1, 2, 3])],
+            responses=[torch.tensor([4, 5])],
+            traj_mask=[torch.tensor([1])],
+        )
+
+        with pytest.raises(ValueError, match="response/mask lengths differ"):
+            _batch_tensors_and_build_data_proto(
+                accumulated,
+                pad_token_id=0,
+                max_prompt_length=3,
+                max_response_length=3,
+            )
+
+        accumulated.traj_mask = [torch.tensor([1, 1])]
+        with pytest.raises(ValueError, match="prompt storage width"):
+            _batch_tensors_and_build_data_proto(
+                accumulated,
+                pad_token_id=0,
+                max_prompt_length=2,
+                max_response_length=3,
+            )
+
+    def test_explicit_sequence_cap_rejects_generic_overflow(self):
+        episode = _make_episode(
+            prompt_ids=[1, 2, 3, 4, 5],
+            completion_ids=[6, 7, 8, 9, 10],
+        )
+
+        with pytest.raises(ValueError, match="sequence cap"):
+            transform_episodes_to_dataproto(
+                [episode],
+                _make_mock_rollout_engine(),
+                max_prompt_length=8,
+                max_response_length=8,
+                max_total_length=9,
+            )
 
     def test_other_batch_fields_unchanged(self):
         """Adding logprobs should not affect existing batch fields."""

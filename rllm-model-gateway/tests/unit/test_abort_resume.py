@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -9,6 +11,37 @@ import pytest
 from rllm_model_gateway import GatewayConfig, create_app
 
 from tests.helpers.mock_vllm import MockVLLMServer
+
+
+def test_resume_loads_tokenizer_from_separate_local_path(monkeypatch):
+    loaded_paths: list[str] = []
+
+    class FakeTokenizer:
+        def decode(self, token_ids, skip_special_tokens=False):
+            del skip_special_tokens
+            return " ".join(map(str, token_ids))
+
+    class FakeAutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, path):
+            loaded_paths.append(path)
+            return FakeTokenizer()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=FakeAutoTokenizer),
+    )
+    config = GatewayConfig(
+        model="Qwen/Qwen3-8B",
+        tokenizer_path="/models/qwen3-8b/snapshots/exact",
+        resume_aborted_requests=True,
+    )
+
+    app = create_app(config)
+
+    assert loaded_paths == ["/models/qwen3-8b/snapshots/exact"]
+    assert app.state.config.model == "Qwen/Qwen3-8B"
 
 
 def _response(
