@@ -448,7 +448,13 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
         max_total_length = max_prompt_length + self.config.data.max_response_length
 
         if trainer_state.episodes is not None:
-            batch = transform_episodes_to_dataproto(trainer_state.episodes, self.rollout_engine, max_prompt_length, max_total_length)
+            batch = transform_episodes_to_dataproto(
+                trainer_state.episodes,
+                self.rollout_engine,
+                max_prompt_length,
+                max_total_length,
+                max_total_length=max_total_length,
+            )
             # Lift per-batch merge metrics (batch/steps_per_traj,
             # batch/step_response_length) out of meta_info so they show up in
             # the standard trainer_state.metrics path. Same metric names the
@@ -459,7 +465,16 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
             return batch
 
         assert trainer_state.trajectory_groups is not None, "Either episodes or trajectory_groups must be set"
-        batch = transform_trajectory_groups_to_dataproto(trainer_state.trajectory_groups, self.rollout_engine, max_prompt_length, max_total_length)
+        batch = transform_trajectory_groups_to_dataproto(
+            trainer_state.trajectory_groups,
+            self.rollout_engine,
+            max_prompt_length,
+            max_total_length,
+            max_total_length=max_total_length,
+        )
+        merge_metrics = batch.meta_info.pop("merge_metrics", None)
+        if merge_metrics:
+            trainer_state.metrics.update(merge_metrics)
         mode = self.algorithm_config.stepwise_advantage_mode if self.algorithm_config is not None else "broadcast"
         return update_dataproto_with_advantages(batch, trainer_state.trajectory_groups, mode=mode)
 

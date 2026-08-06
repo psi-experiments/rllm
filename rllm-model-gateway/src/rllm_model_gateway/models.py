@@ -122,6 +122,10 @@ class GatewayConfig(BaseModel):
     log_level: str = "INFO"
     sync_traces: bool = False
     model: str | None = None  # When set, overrides ``body.model``
+    # Optional local checkpoint used only for tokenizer loading. Keep this
+    # separate from ``model`` so requests can retain the public served-model
+    # name while offline workers read tokenizer files from a mounted volume.
+    tokenizer_path: str | None = None
     cumulative_token_mode: bool = False
     # renderers family for the cumulative-mode bridge. Check supported model families
     # in MODEL_RENDERER_MAP of https://github.com/PrimeIntellect-ai/renderers/blob/main/renderers/base.py

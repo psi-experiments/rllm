@@ -155,6 +155,8 @@ gateway:
                       # (your own tailscale IP, bore/ngrok/frp URL, internal DNS, etc.).
   store: memory       # "memory" (non-persistent) | "sqlite" (writes traces to disk)
   db_path: null       # Only used when store=sqlite; null → auto-resolved path (logged at startup)
+  tokenizer_path: null # null: use actor_rollout_ref.model.path, then model.name.
+                       # Set explicitly when a separate tokenizer checkpoint is required.
   # Sampling params attached to a session overwrite those keys on every LLM call;
   # keys not set pass through untouched.
   cumulative_token_mode: false   # Drift-free multi-turn token forwarding: rewrites turn 2+ to

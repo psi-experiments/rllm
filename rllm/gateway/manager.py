@@ -161,6 +161,12 @@ class GatewayManager:
         self.public_url, self.tunnel_backend = parse_tunnel(gw_cfg.get("tunnel", None))
         # The gateway always pins ``body.model`` to whatever the trainer is serving
         self.model: str | None = config.get("model", {}).get("name", None)
+        # The public model name above is not necessarily resolvable by an
+        # offline Hugging Face client. Prefer the exact checkpoint path already
+        # resolved by the VERL launcher whenever the gateway needs a tokenizer.
+        configured_tokenizer_path = gw_cfg.get("tokenizer_path", None)
+        actor_model_path = config.get("actor_rollout_ref", {}).get("model", {}).get("path", None)
+        self.tokenizer_path: str | None = configured_tokenizer_path or actor_model_path or self.model
 
         # Cumulative token mode: drift-free multi-turn token forwarding. The
         # gateway loads the tokenizer from the served model path. renderers
@@ -369,6 +375,8 @@ class GatewayManager:
             cmd.extend(["--db-path", self.db_path])
         if self.model:
             cmd.extend(["--model", self.model])
+        if self.tokenizer_path:
+            cmd.extend(["--tokenizer-path", self.tokenizer_path])
         if self.cumulative_token_mode:
             cmd.append("--cumulative-token-mode")
             if self.renderer_family != "auto":
@@ -417,6 +425,7 @@ class GatewayManager:
             db_path=self.db_path,
             store_worker=self.store,
             model=self.model,
+            tokenizer_path=self.tokenizer_path,
             add_logprobs=self.add_logprobs,
             add_return_token_ids=self.add_return_token_ids,
             cumulative_token_mode=self.cumulative_token_mode,

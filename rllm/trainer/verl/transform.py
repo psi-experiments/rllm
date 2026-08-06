@@ -133,7 +133,15 @@ def _handle_multimodal_position_ids(processor, input_ids: torch.Tensor, attentio
     return position_ids
 
 
-def _batch_tensors_and_build_data_proto(accumulated: AccumulatedData, pad_token_id: int, max_prompt_length: int, max_response_length: int, processor=None) -> "DataProto":
+def _batch_tensors_and_build_data_proto(
+    accumulated: AccumulatedData,
+    pad_token_id: int,
+    max_prompt_length: int,
+    max_response_length: int,
+    processor=None,
+    *,
+    max_total_length: int | None = None,
+) -> "DataProto":
     """Batches the tensors from an AccumulatedData.
 
     Args:
@@ -141,11 +149,45 @@ def _batch_tensors_and_build_data_proto(accumulated: AccumulatedData, pad_token_
         pad_token_id: The token ID to use for padding.
         max_prompt_length: The maximum length to pad the prompts to.
         max_response_length: The maximum length to pad the responses to.
-        stepwise_advantage_mode: The mode of stepwise advantage computation.
+        max_total_length: Optional cap on prompt plus response non-padding
+            tokens. When set, exceeding it is an error rather than a silent
+            padding-time truncation.
         processor: Optional multimodal processor for handling position IDs (e.g., Qwen2VLProcessor).
     Returns:
         DataProto: The DataProto built from the AccumulatedData.
     """
+    for row, (prompt, response, mask) in enumerate(
+        zip(
+            accumulated.prompts,
+            accumulated.responses,
+            accumulated.traj_mask,
+            strict=True,
+        )
+    ):
+        if prompt.numel() > max_prompt_length:
+            raise ValueError(
+                f"trainer row {row} prompt has {prompt.numel()} tokens, exceeding "
+                f"the {max_prompt_length}-token prompt storage width"
+            )
+        if response.numel() != mask.numel():
+            raise ValueError(
+                f"trainer row {row} response/mask lengths differ: "
+                f"{response.numel()} != {mask.numel()}"
+            )
+        if response.numel() > max_response_length:
+            raise ValueError(
+                f"trainer row {row} response has {response.numel()} tokens, exceeding "
+                f"the {max_response_length}-token response storage width"
+            )
+        if (
+            max_total_length is not None
+            and prompt.numel() + response.numel() > max_total_length
+        ):
+            raise ValueError(
+                f"trainer row {row} has {prompt.numel() + response.numel()} non-padding "
+                f"tokens, exceeding the {max_total_length}-token sequence cap"
+            )
+
     prompts_batch = _pad_sequence_batch(accumulated.prompts, pad_token_id, max_prompt_length, left_pad=True)  # shape: [bs, max_prompt_length]
     responses_batch = _pad_sequence_batch(accumulated.responses, pad_token_id, max_response_length, left_pad=False)  # shape: [bs, max_response_length]
     input_ids = torch.concat([prompts_batch, responses_batch], dim=1)  # shape: [bs, max_prompt_length + max_response_length]
@@ -246,7 +288,15 @@ def _decode_routing_matrices(encoded: list[str] | None) -> torch.Tensor | None:
     return torch.from_numpy(arr.copy())
 
 
-def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: AccumulatedData, chat_parser=None) -> int:
+def _process_trajectory(
+    trajectory: Trajectory,
+    task_id: str,
+    accumulated: AccumulatedData,
+    chat_parser=None,
+    *,
+    max_prompt_length: int | None = None,
+    max_total_length: int | None = None,
+) -> int:
     """Processes a trajectory and returns an AccumulatedData.
 
     Multi-turn trajectories whose steps form a cumulative-prefix chain
@@ -391,6 +441,58 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
         if response.numel() == 0 or mask.sum().item() == 0:
             raise ValueError("rllm cumulative chat conversion produced no assistant tokens")
 
+        if max_prompt_length is None:
+            raise ValueError(
+                "rllm_cumulative_chat requires an explicit prompt-token limit"
+            )
+        if prompt.numel() > max_prompt_length:
+            raise ValueError(
+                f"rllm cumulative prompt has {prompt.numel()} tokens, exceeding "
+                f"the {max_prompt_length}-token prompt storage width"
+            )
+
+        declared_limit = cumulative_config.get("max_total_length")
+        if declared_limit is None and max_total_length is None:
+            raise ValueError(
+                "rllm_cumulative_chat requires an explicit total-token limit"
+            )
+        if declared_limit is None:
+            declared_limit = max_total_length
+        if (
+            not isinstance(declared_limit, int)
+            or isinstance(declared_limit, bool)
+            or declared_limit <= 0
+        ):
+            raise ValueError(
+                "rllm_cumulative_chat max_total_length must be a positive integer"
+            )
+        sequence_limit = (
+            min(max_total_length, declared_limit)
+            if max_total_length is not None
+            else declared_limit
+        )
+        available_response_tokens = sequence_limit - prompt.numel()
+        if available_response_tokens <= 0:
+            raise ValueError(
+                f"rllm cumulative prompt leaves no response room in the "
+                f"{sequence_limit}-token trainer context"
+            )
+        if response.numel() > available_response_tokens:
+            clipped_tokens = response.numel() - available_response_tokens
+            logger.warning(
+                "Clipping %d tokens from Qwen cumulative response to fit %d-token trainer context",
+                clipped_tokens,
+                sequence_limit,
+            )
+            response = response[:available_response_tokens]
+            mask = mask[:available_response_tokens]
+            accumulated.context_clipped_rows += 1
+            accumulated.context_clipped_tokens += clipped_tokens
+            if response.numel() == 0 or mask.sum().item() == 0:
+                raise ValueError(
+                    "rllm cumulative context clipping removed all assistant tokens"
+                )
+
         accumulated.add_step(
             step_data=ProcessedStepData(
                 prompt=prompt,
@@ -411,6 +513,14 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
             group_role=name,
         )
         return True
+
+    # Qwen may happen to produce a literal token-prefix extension on some
+    # turns and not others.  The opt-in contract is canonical cumulative-chat
+    # tokenization, so apply it deterministically rather than only as a
+    # fallback after prefix matching fails.
+    if cumulative_config is not None and isinstance(chat_parser, QwenChatTemplateParser):
+        if _emit_qwen_cumulative_chat():
+            return 1
 
     seg = _new_segment(valid_steps[0])
     segments_emitted = 0
@@ -448,7 +558,15 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
     return segments_emitted
 
 
-def _process_episode(episode: Episode, task_id: str, accumulated: AccumulatedData, chat_parser=None) -> int:
+def _process_episode(
+    episode: Episode,
+    task_id: str,
+    accumulated: AccumulatedData,
+    chat_parser=None,
+    *,
+    max_prompt_length: int | None = None,
+    max_total_length: int | None = None,
+) -> int:
     """Processes an episode and returns an AccumulatedData.
 
     Args:
@@ -468,7 +586,14 @@ def _process_episode(episode: Episode, task_id: str, accumulated: AccumulatedDat
         return 0
 
     for trajectory in episode.trajectories:
-        n_steps = _process_trajectory(trajectory, task_id, accumulated, chat_parser=chat_parser)
+        n_steps = _process_trajectory(
+            trajectory,
+            task_id,
+            accumulated,
+            chat_parser=chat_parser,
+            max_prompt_length=max_prompt_length,
+            max_total_length=max_total_length,
+        )
         total_steps += n_steps
 
     # Extend episode-level data for all steps in this episode
@@ -481,11 +606,26 @@ def _process_episode(episode: Episode, task_id: str, accumulated: AccumulatedDat
     return total_steps
 
 
-def _process_trajectory_group(trajectory_group: TrajectoryGroup, task_id: str, accumulated: AccumulatedData, chat_parser=None) -> int:
+def _process_trajectory_group(
+    trajectory_group: TrajectoryGroup,
+    task_id: str,
+    accumulated: AccumulatedData,
+    chat_parser=None,
+    *,
+    max_prompt_length: int | None = None,
+    max_total_length: int | None = None,
+) -> int:
     """Processes a trajectory group and returns an AccumulatedData."""
     total_steps = 0
     for trajectory in trajectory_group.trajectories:
-        n_steps = _process_trajectory(trajectory, task_id, accumulated, chat_parser=chat_parser)
+        n_steps = _process_trajectory(
+            trajectory,
+            task_id,
+            accumulated,
+            chat_parser=chat_parser,
+            max_prompt_length=max_prompt_length,
+            max_total_length=max_total_length,
+        )
         total_steps += n_steps
 
     # Extend episode-level data for all steps in this trajectory group
@@ -553,6 +693,8 @@ def _compute_merge_metrics(accumulated: AccumulatedData, total_agent_steps: int)
         "batch/action_token_ratio/min": float(_np.min(action_token_ratios)) if action_token_ratios else 0.0,
         "batch/action_token_ratio/max": float(_np.max(action_token_ratios)) if action_token_ratios else 0.0,
         "batch/merge_compression_ratio": (total_agent_steps / total_emitted_rows if total_emitted_rows > 0 else 0.0),
+        "batch/context_clipped_rows": int(accumulated.context_clipped_rows),
+        "batch/context_clipped_tokens": int(accumulated.context_clipped_tokens),
     }
 
 
@@ -561,6 +703,7 @@ def transform_episodes_to_dataproto(
     rollout_engine: VerlEngine,
     max_prompt_length: int,
     max_response_length: int,
+    max_total_length: int | None = None,
 ) -> DataProto:
     """
     Transforms a list of episodes (from running a rLLM workflow) into a verl-compatible DataProto.
@@ -570,7 +713,9 @@ def transform_episodes_to_dataproto(
         rollout_engine: Rollout engine that contains the tokenizer and (optional) multimodal processor.
         max_prompt_length: The maximum length of the prompts.
         max_response_length: The maximum length of the responses.
-        stepwise_advantage_mode: The mode of stepwise advantage computation.
+        max_total_length: Optional cap on prompt plus response non-padding
+            tokens. Qwen cumulative-chat rows are clipped to this cap before
+            batching; other overlong rows are rejected.
     Returns:
         DataProto: The DataProto built from the episodes. Per-batch merge
         metrics (batch/steps_per_traj, batch/step_response_length) are
@@ -585,12 +730,26 @@ def transform_episodes_to_dataproto(
     for episode in episodes:
         task_id = episode.task_id
         total_agent_steps += sum(len(traj.steps) for traj in episode.trajectories)
-        total_steps = _process_episode(episode, task_id, accumulated, chat_parser=rollout_engine.chat_parser)
+        total_steps = _process_episode(
+            episode,
+            task_id,
+            accumulated,
+            chat_parser=rollout_engine.chat_parser,
+            max_prompt_length=max_prompt_length,
+            max_total_length=max_total_length,
+        )
         accumulated.repeat_counts.append(total_steps)
 
     assert hasattr(tokenizer, "pad_token_id"), "Tokenizer must have a pad token ID"
     pad_token_id = tokenizer.pad_token_id
-    batch = _batch_tensors_and_build_data_proto(accumulated, pad_token_id, max_prompt_length, max_response_length, processor)
+    batch = _batch_tensors_and_build_data_proto(
+        accumulated,
+        pad_token_id,
+        max_prompt_length,
+        max_response_length,
+        processor,
+        max_total_length=max_total_length,
+    )
     batch.meta_info["merge_metrics"] = _compute_merge_metrics(accumulated, total_agent_steps)
     return batch
 
@@ -601,6 +760,7 @@ def transform_trajectory_groups_to_dataproto(
     rollout_engine: VerlEngine,
     max_prompt_length: int,
     max_response_length: int,
+    max_total_length: int | None = None,
 ) -> DataProto:
     """
     Transforms a list of trajectory groups (from running a rLLM workflow) into a verl-compatible DataProto.
@@ -611,12 +771,36 @@ def transform_trajectory_groups_to_dataproto(
     accumulated = AccumulatedData()
     for trajectory_group in trajectory_groups:
         task_id = trajectory_group.task_id
-        total_steps = _process_trajectory_group(trajectory_group, task_id, accumulated, chat_parser=rollout_engine.chat_parser)
+        total_steps = _process_trajectory_group(
+            trajectory_group,
+            task_id,
+            accumulated,
+            chat_parser=rollout_engine.chat_parser,
+            max_prompt_length=max_prompt_length,
+            max_total_length=max_total_length,
+        )
         accumulated.repeat_counts.append(total_steps)
 
     assert tokenizer is not None and hasattr(tokenizer, "pad_token_id"), "Tokenizer must have a pad token ID"
     pad_token_id = tokenizer.pad_token_id
-    return _batch_tensors_and_build_data_proto(accumulated, pad_token_id, max_prompt_length, max_response_length, processor)
+    batch = _batch_tensors_and_build_data_proto(
+        accumulated,
+        pad_token_id,
+        max_prompt_length,
+        max_response_length,
+        processor,
+        max_total_length=max_total_length,
+    )
+    total_agent_steps = sum(
+        len(trajectory.steps)
+        for group in trajectory_groups
+        for trajectory in group.trajectories
+    )
+    batch.meta_info["merge_metrics"] = _compute_merge_metrics(
+        accumulated,
+        total_agent_steps,
+    )
+    return batch
 
 
 def update_dataproto_with_advantages(batch: DataProto, container: list[Episode] | list[TrajectoryGroup], mode: str = "broadcast") -> DataProto:
