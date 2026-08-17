@@ -74,7 +74,7 @@ class TestGatewayAbortResume:
                                 "tool_call_parser": "psi_hermes_concurrent",
                             }
                         }
-                    }
+                    },
                 },
             }
         )
@@ -94,6 +94,14 @@ class TestGatewayAbortResume:
         config.rllm.gateway.tokenizer_path = "/models/tokenizer-only"
         gateway = GatewayManager(config, mode="process")
         assert gateway.tokenizer_path == "/models/tokenizer-only"
+
+    def test_no_progress_resume_limit_is_configurable(self):
+        config = self._config(enabled=True, partial_rollout=True)
+        config.rllm.gateway.max_consecutive_no_progress_resumes = 7
+
+        gateway = GatewayManager(config, mode="process")
+
+        assert gateway.max_consecutive_no_progress_resumes == 7
 
     @pytest.mark.parametrize(
         ("enabled", "partial_rollout"),

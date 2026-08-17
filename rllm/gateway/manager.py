@@ -186,6 +186,7 @@ class GatewayManager:
         vllm_engine_kwargs = rollout_cfg.get("engine_kwargs", {}).get("vllm", {})
         configured_tool_parser = gw_cfg.get("abort_resume_tool_parser", None)
         self.abort_resume_tool_parser: str | None = configured_tool_parser if configured_tool_parser is not None else vllm_engine_kwargs.get("tool_call_parser", None)
+        self.max_consecutive_no_progress_resumes: int = gw_cfg.get("max_consecutive_no_progress_resumes", 120)
 
         self.mode = mode
 
@@ -383,6 +384,12 @@ class GatewayManager:
                 cmd.extend(["--renderer-family", self.renderer_family])
         if self.resume_aborted_requests:
             cmd.append("--resume-aborted-requests")
+            cmd.extend(
+                [
+                    "--max-consecutive-no-progress-resumes",
+                    str(self.max_consecutive_no_progress_resumes),
+                ]
+            )
             if self.abort_resume_tool_parser:
                 cmd.extend(
                     [
@@ -432,6 +439,7 @@ class GatewayManager:
             renderer_family=self.renderer_family,
             resume_aborted_requests=(self.resume_aborted_requests and local_handler is None),
             abort_resume_tool_parser=self.abort_resume_tool_parser,
+            max_consecutive_no_progress_resumes=self.max_consecutive_no_progress_resumes,
         )
         app = create_app(config=gw_config, local_handler=local_handler)
 

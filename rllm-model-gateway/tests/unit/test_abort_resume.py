@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from rllm_model_gateway import GatewayConfig, create_app
 
 from tests.helpers.mock_vllm import MockVLLMServer
@@ -60,6 +61,11 @@ def test_resume_loads_tokenizer_from_separate_local_path(monkeypatch):
 
     assert loaded_paths == ["/models/qwen3-8b/snapshots/exact"]
     assert app.state.config.model == "Qwen/Qwen3-8B"
+
+
+def test_no_progress_resume_limit_must_be_positive():
+    with pytest.raises(ValidationError):
+        GatewayConfig(max_consecutive_no_progress_resumes=0)
 
 
 def _response(
@@ -124,6 +130,7 @@ def _app(
     decoder,
     *,
     tool_parser: str | None = None,
+    max_consecutive_no_progress_resumes: int = 120,
 ):
     config = GatewayConfig(
         store_worker="memory",
@@ -132,6 +139,7 @@ def _app(
         sync_traces=True,
         resume_aborted_requests=True,
         abort_resume_tool_parser=tool_parser,
+        max_consecutive_no_progress_resumes=max_consecutive_no_progress_resumes,
     )
     app = create_app(config, token_decoder=decoder)
     app.state.proxy.abort_resume_delay_s = 0
@@ -384,8 +392,11 @@ async def test_zero_progress_interruptions_return_bounded_gateway_error(
         chat=True,
     )
     mock_vllm.queue_responses(*[empty_abort for _ in range(5)])
-    app = _app(mock_vllm, lambda ids: "")
-    app.state.proxy.max_abort_resume_no_progress = 2
+    app = _app(
+        mock_vllm,
+        lambda ids: "",
+        max_consecutive_no_progress_resumes=2,
+    )
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
