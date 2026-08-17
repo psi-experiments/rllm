@@ -97,10 +97,10 @@ class ReverseProxy:
         abort_resume_tool_parser: str | None = None,
         token_decoder: TokenDecoder | None = None,
         abort_resume_delay_s: float = 1.0,
-        max_abort_resume_no_progress: int = 120,
+        max_consecutive_no_progress_resumes: int = 120,
     ) -> None:
-        if max_abort_resume_no_progress < 1:
-            raise ValueError("max_abort_resume_no_progress must be positive")
+        if max_consecutive_no_progress_resumes < 1:
+            raise ValueError("max_consecutive_no_progress_resumes must be positive")
         self.router = router
         self.store = store
         self.strip_vllm = strip_vllm
@@ -113,7 +113,7 @@ class ReverseProxy:
         self.abort_resume_tool_parser = abort_resume_tool_parser
         self.token_decoder = token_decoder
         self.abort_resume_delay_s = abort_resume_delay_s
-        self.max_abort_resume_no_progress = max_abort_resume_no_progress
+        self.max_consecutive_no_progress_resumes = max_consecutive_no_progress_resumes
         self.weight_version: int | None = None
         self._http: httpx.AsyncClient | None = None
         self._pending_traces: set[asyncio.Task[None]] = set()
@@ -329,7 +329,7 @@ class ReverseProxy:
             )
             no_progress_interruptions = 1 if generation.should_resume and not generation.completion_token_ids else 0
             while generation.should_resume:
-                if no_progress_interruptions >= self.max_abort_resume_no_progress:
+                if no_progress_interruptions >= self.max_consecutive_no_progress_resumes:
                     raise AbortResumeError(f"Interrupted generation made no token progress across {no_progress_interruptions} consecutive responses")
                 logger.info(
                     "Resuming interrupted model turn for session %s (%d saved tokens)",

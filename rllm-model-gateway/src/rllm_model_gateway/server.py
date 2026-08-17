@@ -162,10 +162,7 @@ def create_app(
     if needs_tokenizer:
         tokenizer_source = config.tokenizer_path or config.model
         if not tokenizer_source:
-            raise ValueError(
-                "cumulative_token_mode or resume_aborted_requests requires "
-                "'tokenizer_path' or 'model' to be set in GatewayConfig"
-            )
+            raise ValueError("cumulative_token_mode or resume_aborted_requests requires 'tokenizer_path' or 'model' to be set in GatewayConfig")
         try:
             from transformers import AutoTokenizer
         except ImportError as err:
@@ -227,6 +224,7 @@ def create_app(
         resume_aborted_requests=config.resume_aborted_requests,
         abort_resume_tool_parser=config.abort_resume_tool_parser,
         token_decoder=token_decoder,
+        max_consecutive_no_progress_resumes=config.max_consecutive_no_progress_resumes,
     )
     sessions = SessionManager(store)
 
@@ -535,6 +533,8 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         data["resume_aborted_requests"] = True
     if getattr(args, "abort_resume_tool_parser", None) is not None:
         data["abort_resume_tool_parser"] = args.abort_resume_tool_parser
+    if getattr(args, "max_consecutive_no_progress_resumes", None) is not None:
+        data["max_consecutive_no_progress_resumes"] = args.max_consecutive_no_progress_resumes
 
     # Workers from CLI --worker flags (WorkerConfig validator auto-splits URLs)
     worker_urls = getattr(args, "worker", None) or []
@@ -573,10 +573,7 @@ def main() -> None:
         "--tokenizer-path",
         type=str,
         default=None,
-        help=(
-            "Optional local HuggingFace checkpoint used for tokenizer loading. "
-            "The public --model name is still forwarded to inference workers."
-        ),
+        help=("Optional local HuggingFace checkpoint used for tokenizer loading. The public --model name is still forwarded to inference workers."),
     )
     parser.add_argument(
         "--cumulative-token-mode",
@@ -605,6 +602,12 @@ def main() -> None:
         type=str,
         default=None,
         help=("vLLM tool parser whose non-streaming output contract must be reconstructed after a resumed request (hermes or psi_hermes_concurrent)."),
+    )
+    parser.add_argument(
+        "--max-consecutive-no-progress-resumes",
+        type=int,
+        default=None,
+        help="Maximum consecutive interrupted responses without new tokens before abort-resume returns an error.",
     )
 
     args = parser.parse_args()

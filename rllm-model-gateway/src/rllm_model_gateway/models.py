@@ -134,3 +134,4 @@ class GatewayConfig(BaseModel):
     # that same model turn from its raw token IDs before returning to the agent.
     resume_aborted_requests: bool = False
     abort_resume_tool_parser: str | None = None
+    max_consecutive_no_progress_resumes: int = Field(default=120, gt=0)

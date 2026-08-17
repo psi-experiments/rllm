@@ -170,6 +170,8 @@ gateway:
   resume_aborted_requests: null  # null: automatically enable when fully async partial rollouts are on.
                                  # Only model generation is resumed; tool/simulator calls are never replayed.
   abort_resume_tool_parser: null # null: inherit the vLLM tool_call_parser configured for the rollout.
+  max_consecutive_no_progress_resumes: 120 # Fail a resumed model turn after this many consecutive
+                                           # interrupted responses produce no additional tokens.
 
 # Async Training Configuration
 async_training:

@@ -5,6 +5,7 @@ mock vLLM backend server for proxy tests.
 """
 
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ import pytest_asyncio
 from rllm_model_gateway import GatewayConfig, create_app
 from rllm_model_gateway.models import WorkerConfig, WorkerInfo, _split_worker_url
 from rllm_model_gateway.proxy import ReverseProxy
+from rllm_model_gateway.server import _load_config
 
 from tests.helpers.mock_vllm import MockVLLMServer
 
@@ -57,6 +59,12 @@ class TestHealth:
         assert resp.status_code == 200
         data = resp.json()
         assert data["total"] >= 1
+
+
+def test_cli_config_loads_no_progress_resume_limit():
+    config = _load_config(SimpleNamespace(max_consecutive_no_progress_resumes=7))
+
+    assert config.max_consecutive_no_progress_resumes == 7
 
 
 # ------------------------------------------------------------------
