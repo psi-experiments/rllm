@@ -1,5 +1,7 @@
 """Unit tests for GatewayManager store-backend selection and validation."""
 
+from types import SimpleNamespace
+
 import pytest
 from omegaconf import OmegaConf
 
@@ -102,6 +104,59 @@ class TestGatewayAbortResume:
         gateway = GatewayManager(config, mode="process")
 
         assert gateway.max_consecutive_no_progress_resumes == 7
+
+    def test_process_mode_forwards_no_progress_resume_limit(self, monkeypatch):
+        config = self._config(enabled=True, partial_rollout=True)
+        config.rllm.gateway.max_consecutive_no_progress_resumes = 7
+        gateway = GatewayManager(config, mode="process")
+        gateway._client = SimpleNamespace(health=lambda: None)
+        commands = []
+
+        monkeypatch.setattr(
+            "rllm.gateway.manager.subprocess.Popen",
+            lambda command: commands.append(command) or SimpleNamespace(),
+        )
+
+        gateway._start_process()
+
+        command = commands[0]
+        option_index = command.index("--max-consecutive-no-progress-resumes")
+        assert command[option_index + 1] == "7"
+
+    def test_thread_mode_forwards_no_progress_resume_limit(self, monkeypatch):
+        import uvicorn
+        from rllm_model_gateway import server as gateway_server
+
+        config = self._config(enabled=True, partial_rollout=True)
+        config.rllm.gateway.max_consecutive_no_progress_resumes = 7
+        gateway = GatewayManager(config, mode="thread")
+        captured = {}
+
+        def capture_config(*, config, local_handler):
+            captured["config"] = config
+            return SimpleNamespace()
+
+        class FakeServer:
+            started = True
+
+            def run(self):
+                pass
+
+        class FakeThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        monkeypatch.setattr(gateway_server, "create_app", capture_config)
+        monkeypatch.setattr(uvicorn, "Config", lambda *args, **kwargs: SimpleNamespace())
+        monkeypatch.setattr(uvicorn, "Server", lambda config: FakeServer())
+        monkeypatch.setattr("rllm.gateway.manager.threading.Thread", FakeThread)
+
+        gateway._start_thread()
+
+        assert captured["config"].max_consecutive_no_progress_resumes == 7
 
     @pytest.mark.parametrize(
         ("enabled", "partial_rollout"),

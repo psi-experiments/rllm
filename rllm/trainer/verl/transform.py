@@ -165,28 +165,13 @@ def _batch_tensors_and_build_data_proto(
         )
     ):
         if prompt.numel() > max_prompt_length:
-            raise ValueError(
-                f"trainer row {row} prompt has {prompt.numel()} tokens, exceeding "
-                f"the {max_prompt_length}-token prompt storage width"
-            )
+            raise ValueError(f"trainer row {row} prompt has {prompt.numel()} tokens, exceeding the {max_prompt_length}-token prompt storage width")
         if response.numel() != mask.numel():
-            raise ValueError(
-                f"trainer row {row} response/mask lengths differ: "
-                f"{response.numel()} != {mask.numel()}"
-            )
+            raise ValueError(f"trainer row {row} response/mask lengths differ: {response.numel()} != {mask.numel()}")
         if response.numel() > max_response_length:
-            raise ValueError(
-                f"trainer row {row} response has {response.numel()} tokens, exceeding "
-                f"the {max_response_length}-token response storage width"
-            )
-        if (
-            max_total_length is not None
-            and prompt.numel() + response.numel() > max_total_length
-        ):
-            raise ValueError(
-                f"trainer row {row} has {prompt.numel() + response.numel()} non-padding "
-                f"tokens, exceeding the {max_total_length}-token sequence cap"
-            )
+            raise ValueError(f"trainer row {row} response has {response.numel()} tokens, exceeding the {max_response_length}-token response storage width")
+        if max_total_length is not None and prompt.numel() + response.numel() > max_total_length:
+            raise ValueError(f"trainer row {row} has {prompt.numel() + response.numel()} non-padding tokens, exceeding the {max_total_length}-token sequence cap")
 
     prompts_batch = _pad_sequence_batch(accumulated.prompts, pad_token_id, max_prompt_length, left_pad=True)  # shape: [bs, max_prompt_length]
     responses_batch = _pad_sequence_batch(accumulated.responses, pad_token_id, max_response_length, left_pad=False)  # shape: [bs, max_response_length]
@@ -442,41 +427,21 @@ def _process_trajectory(
             raise ValueError("rllm cumulative chat conversion produced no assistant tokens")
 
         if max_prompt_length is None:
-            raise ValueError(
-                "rllm_cumulative_chat requires an explicit prompt-token limit"
-            )
+            raise ValueError("rllm_cumulative_chat requires an explicit prompt-token limit")
         if prompt.numel() > max_prompt_length:
-            raise ValueError(
-                f"rllm cumulative prompt has {prompt.numel()} tokens, exceeding "
-                f"the {max_prompt_length}-token prompt storage width"
-            )
+            raise ValueError(f"rllm cumulative prompt has {prompt.numel()} tokens, exceeding the {max_prompt_length}-token prompt storage width")
 
         declared_limit = cumulative_config.get("max_total_length")
         if declared_limit is None and max_total_length is None:
-            raise ValueError(
-                "rllm_cumulative_chat requires an explicit total-token limit"
-            )
+            raise ValueError("rllm_cumulative_chat requires an explicit total-token limit")
         if declared_limit is None:
             declared_limit = max_total_length
-        if (
-            not isinstance(declared_limit, int)
-            or isinstance(declared_limit, bool)
-            or declared_limit <= 0
-        ):
-            raise ValueError(
-                "rllm_cumulative_chat max_total_length must be a positive integer"
-            )
-        sequence_limit = (
-            min(max_total_length, declared_limit)
-            if max_total_length is not None
-            else declared_limit
-        )
+        if not isinstance(declared_limit, int) or isinstance(declared_limit, bool) or declared_limit <= 0:
+            raise ValueError("rllm_cumulative_chat max_total_length must be a positive integer")
+        sequence_limit = min(max_total_length, declared_limit) if max_total_length is not None else declared_limit
         available_response_tokens = sequence_limit - prompt.numel()
         if available_response_tokens <= 0:
-            raise ValueError(
-                f"rllm cumulative prompt leaves no response room in the "
-                f"{sequence_limit}-token trainer context"
-            )
+            raise ValueError(f"rllm cumulative prompt leaves no response room in the {sequence_limit}-token trainer context")
         if response.numel() > available_response_tokens:
             clipped_tokens = response.numel() - available_response_tokens
             logger.warning(
@@ -489,9 +454,7 @@ def _process_trajectory(
             accumulated.context_clipped_rows += 1
             accumulated.context_clipped_tokens += clipped_tokens
             if response.numel() == 0 or mask.sum().item() == 0:
-                raise ValueError(
-                    "rllm cumulative context clipping removed all assistant tokens"
-                )
+                raise ValueError("rllm cumulative context clipping removed all assistant tokens")
 
         accumulated.add_step(
             step_data=ProcessedStepData(
@@ -791,11 +754,7 @@ def transform_trajectory_groups_to_dataproto(
         processor,
         max_total_length=max_total_length,
     )
-    total_agent_steps = sum(
-        len(trajectory.steps)
-        for group in trajectory_groups
-        for trajectory in group.trajectories
-    )
+    total_agent_steps = sum(len(trajectory.steps) for group in trajectory_groups for trajectory in group.trajectories)
     batch.meta_info["merge_metrics"] = _compute_merge_metrics(
         accumulated,
         total_agent_steps,
