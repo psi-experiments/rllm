@@ -171,7 +171,14 @@ class ChatTemplateParser:
                 response_ids.extend(ids)
                 response_mask.extend([1] * len(ids))
             else:
-                response = self.parse([messages[i]], is_first_msg=False, add_generation_prompt=True, accumulate_reasoning=False, tools=tools)
+                next_is_assistant = i + 1 < len(messages) and messages[i + 1]["role"] == "assistant"
+                response = self.parse(
+                    [messages[i]],
+                    is_first_msg=False,
+                    add_generation_prompt=next_is_assistant,
+                    accumulate_reasoning=False,
+                    tools=tools,
+                )
                 ids = self.tokenizer.encode(response, add_special_tokens=False)
                 response_ids.extend(ids)
                 response_mask.extend([0] * len(ids))

@@ -9,6 +9,62 @@ from rllm.parser import (
 from rllm.parser.utils import PARSER_TEST_MESSAGES
 
 
+class _CharacterTokenizer:
+    name_or_path = "Qwen/test-tokenizer"
+    bos_token = ""
+    eos_token = "<|im_end|>"
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        add_generation_prompt=False,
+        tokenize=False,
+    ):
+        del messages, tokenize
+        return "prompt<|im_start|>assistant\n" if add_generation_prompt else "prompt"
+
+    def encode(self, text, *, add_special_tokens=False):
+        del add_special_tokens
+        return [ord(char) for char in text]
+
+    def decode(self, token_ids, *, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join(chr(token_id) for token_id in token_ids)
+
+
+def test_qwen_cumulative_mask_has_no_assistant_boundary_between_tool_results():
+    tokenizer = _CharacterTokenizer()
+    parser = QwenChatTemplateParser(tokenizer)
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "first"},
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "search",
+            "content": "one",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "name": "search",
+            "content": "two",
+        },
+        {"role": "assistant", "content": "last"},
+    ]
+
+    _, response_ids, response_mask = parser.tokenize_and_mask_cumulative(messages)
+    response = tokenizer.decode(response_ids.tolist())
+
+    expected_first_action = "first<|im_end|>\n"
+    expected_tool_results = "<|im_start|>user\n<tool_response>\none\n</tool_response><|im_end|>\n<|im_start|>user\n<tool_response>\ntwo\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    expected_last_action = "last<|im_end|>\n"
+    assert response == expected_first_action + expected_tool_results + expected_last_action
+    assert response.count(parser.assistant_token) == 1
+    assert response_mask.sum().item() == len(expected_first_action) + len(expected_last_action)
+
+
 def test_qwen_chat_template_parser():
     # Test with Qwen tokenizer
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
