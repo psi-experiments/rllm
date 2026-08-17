@@ -13,6 +13,24 @@ from rllm_model_gateway import GatewayConfig, create_app
 from tests.helpers.mock_vllm import MockVLLMServer
 
 
+class _RenderedTokens:
+    def __init__(self, token_ids: list[int]) -> None:
+        self.token_ids = token_ids
+
+
+class _CumulativeRenderer:
+    def bridge_to_next_turn(
+        self,
+        prev_prompt_ids,
+        prev_completion_ids,
+        new_messages,
+        *,
+        tools=None,
+    ):
+        del new_messages, tools
+        return _RenderedTokens(list(prev_prompt_ids) + list(prev_completion_ids) + [99])
+
+
 def test_resume_loads_tokenizer_from_separate_local_path(monkeypatch):
     loaded_paths: list[str] = []
 
@@ -263,6 +281,129 @@ async def test_repeated_interruptions_keep_extending_the_same_turn(
     ]
     assert traces[0]["completion_token_ids"] == [10, 11, 12]
     assert traces[0]["metadata"]["interruption_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cumulative_second_turn_resumes_before_returning_to_agent(
+    mock_vllm: MockVLLMServer,
+):
+    first_turn = _response(
+        prompt_ids=[1, 2],
+        token_ids=[10],
+        logprobs=[-0.1],
+        finish_reason="stop",
+        text="first answer",
+        chat=True,
+    )
+    cumulative_prompt = [1, 2, 10, 99]
+    interrupted = _response(
+        prompt_ids=cumulative_prompt,
+        token_ids=[20],
+        logprobs=[-0.2],
+        finish_reason="abort",
+        text="partial",
+        chat=False,
+    )
+    resumed = _response(
+        prompt_ids=cumulative_prompt + [20],
+        token_ids=[21],
+        logprobs=[-0.3],
+        finish_reason="stop",
+        text=" suffix",
+        chat=False,
+    )
+    mock_vllm.queue_responses(first_turn, interrupted, resumed)
+    app = _app(
+        mock_vllm,
+        lambda ids: "complete second answer" if ids == [20, 21] else "wrong",
+    )
+    app.state.proxy.cumulative_token_mode = True
+    app.state.proxy.renderer = _CumulativeRenderer()
+    release_request_counts: list[int] = []
+    original_release = app.state.proxy.router.release
+
+    def record_release(worker_url: str) -> None:
+        release_request_counts.append(len(mock_vllm.request_log))
+        original_release(worker_url)
+
+    app.state.proxy.router.release = record_release
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        first_response = await client.post(
+            "/sessions/cumulative/v1/chat/completions",
+            json={
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "first"}],
+                "max_tokens": 4,
+            },
+        )
+        second_response = await client.post(
+            "/sessions/cumulative/v1/chat/completions",
+            json={
+                "model": "mock-model",
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {
+                        "role": "assistant",
+                        "content": first_response.json()["choices"][0]["message"]["content"],
+                    },
+                    {"role": "user", "content": "second"},
+                ],
+                "max_tokens": 4,
+            },
+        )
+        traces = (await client.get("/sessions/cumulative/traces")).json()
+
+    assert second_response.status_code == 200
+    assert second_response.json()["choices"][0]["finish_reason"] == "stop"
+    assert second_response.json()["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": "complete second answer",
+    }
+    assert len(mock_vllm.request_log) == 3
+    assert mock_vllm.request_log[1]["prompt"] == cumulative_prompt
+    assert mock_vllm.request_log[2]["prompt"] == cumulative_prompt + [20]
+    assert release_request_counts == [1, 3]
+    assert traces[1]["completion_token_ids"] == [20, 21]
+    assert traces[1]["metadata"]["interruption_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_zero_progress_interruptions_return_bounded_gateway_error(
+    mock_vllm: MockVLLMServer,
+):
+    empty_abort = _response(
+        prompt_ids=[1, 2],
+        token_ids=[],
+        logprobs=[],
+        finish_reason="abort",
+        text="",
+        chat=True,
+    )
+    mock_vllm.queue_responses(*[empty_abort for _ in range(5)])
+    app = _app(mock_vllm, lambda ids: "")
+    app.state.proxy.max_abort_resume_no_progress = 2
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/sessions/stalled/v1/chat/completions",
+            json={
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4,
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "rllm_abort_resume_error"
+    assert "no token progress" in response.json()["error"]["message"]
+    assert len(mock_vllm.request_log) == 2
 
 
 @pytest.mark.asyncio
