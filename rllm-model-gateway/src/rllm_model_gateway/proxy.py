@@ -15,6 +15,12 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
+from rllm_model_gateway.abort_resume import (
+    AbortedGeneration,
+    AbortResumeError,
+    TokenDecoder,
+    is_aborted_response,
+)
 from rllm_model_gateway.data_process import (
     build_trace_record,
     build_trace_record_from_chunks,
@@ -87,7 +93,14 @@ class ReverseProxy:
         local_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
         cumulative_token_mode: bool = False,
         renderer: Any = None,
+        resume_aborted_requests: bool = False,
+        abort_resume_tool_parser: str | None = None,
+        token_decoder: TokenDecoder | None = None,
+        abort_resume_delay_s: float = 1.0,
+        max_consecutive_no_progress_resumes: int = 120,
     ) -> None:
+        if max_consecutive_no_progress_resumes < 1:
+            raise ValueError("max_consecutive_no_progress_resumes must be positive")
         self.router = router
         self.store = store
         self.strip_vllm = strip_vllm
@@ -96,6 +109,11 @@ class ReverseProxy:
         self.local_handler = local_handler
         self.cumulative_token_mode = cumulative_token_mode
         self.renderer = renderer
+        self.resume_aborted_requests = resume_aborted_requests
+        self.abort_resume_tool_parser = abort_resume_tool_parser
+        self.token_decoder = token_decoder
+        self.abort_resume_delay_s = abort_resume_delay_s
+        self.max_consecutive_no_progress_resumes = max_consecutive_no_progress_resumes
         self.weight_version: int | None = None
         self._http: httpx.AsyncClient | None = None
         self._pending_traces: set[asyncio.Task[None]] = set()
@@ -196,6 +214,7 @@ class ReverseProxy:
         originally_requested_logprobs: bool = False,
     ) -> Response:
         t0 = time.perf_counter()
+        resume_metadata: dict[str, Any] | None = None
 
         if self.local_handler is not None:
             # In-process path: call handler directly, no HTTP
@@ -215,20 +234,38 @@ class ReverseProxy:
                 )
                 content = resp.content
                 status_code = resp.status_code
+                # Parse response for trace extraction before releasing the
+                # selected worker. An interrupted request must continue on
+                # this same worker because it owns the rollout model replica.
+                try:
+                    response_body = json.loads(content)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    response_body = {}
+
+                if self.resume_aborted_requests and status_code < 400 and is_aborted_response(response_body):
+                    response_body, status_code, resume_metadata = await self._resume_aborted_generation(
+                        request=request,
+                        worker_api_url=worker.api_url,
+                        headers=headers,
+                        request_body=request_body,
+                        first_response=response_body,
+                        session_id=session_id,
+                    )
             finally:
                 self.router.release(worker.url)
-
-            # Parse response for trace extraction
-            try:
-                response_body = json.loads(content)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                response_body = {}
 
         latency_ms = (time.perf_counter() - t0) * 1000
 
         # Persist trace
         if session_id and response_body:
-            trace = build_trace_record(session_id, request_body, response_body, latency_ms, weight_version=request.state.weight_version)
+            trace = build_trace_record(
+                session_id,
+                request_body,
+                response_body,
+                latency_ms,
+                metadata=resume_metadata,
+                weight_version=request.state.weight_version,
+            )
             await self._persist(trace)
 
             # Ingest first turn into accumulator for cumulative token mode
@@ -257,6 +294,87 @@ class ReverseProxy:
             status_code=status_code,
             media_type="application/json",
         )
+
+    async def _resume_aborted_generation(
+        self,
+        *,
+        request: Request,
+        worker_api_url: str,
+        headers: dict[str, str],
+        request_body: dict[str, Any],
+        first_response: dict[str, Any],
+        session_id: str | None,
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        """Finish one aborted model turn without exposing partial output.
+
+        Tool execution happens after this HTTP request returns to the agent,
+        so this loop can never replay an MCP/simulator call.
+        """
+        if self.token_decoder is None:
+            error = AbortResumeError("resume_aborted_requests=True requires a model token decoder")
+            return self._abort_resume_error(error), 502, {"interruption_count": 1}
+
+        generation: AbortedGeneration | None = None
+        try:
+            generation = AbortedGeneration(
+                request_body,
+                first_response,
+                decoder=self.token_decoder,
+                tool_parser=self.abort_resume_tool_parser,
+            )
+            continuation_url = self._build_url(
+                worker_api_url,
+                "/v1/completions",
+                "",
+            )
+            no_progress_interruptions = 1 if generation.should_resume and not generation.completion_token_ids else 0
+            while generation.should_resume:
+                if no_progress_interruptions >= self.max_consecutive_no_progress_resumes:
+                    raise AbortResumeError(f"Interrupted generation made no token progress across {no_progress_interruptions} consecutive responses")
+                logger.info(
+                    "Resuming interrupted model turn for session %s (%d saved tokens)",
+                    session_id,
+                    len(generation.completion_token_ids),
+                )
+                await asyncio.sleep(self.abort_resume_delay_s)
+                continuation_body = generation.continuation_body()
+                saved_token_count = len(generation.completion_token_ids)
+                resp = await self._send_with_retry(
+                    method=request.method,
+                    url=continuation_url,
+                    content=json.dumps(continuation_body).encode("utf-8"),
+                    headers=headers,
+                )
+                if resp.status_code >= 400:
+                    raise AbortResumeError(f"vLLM returned HTTP {resp.status_code} while resuming an interrupted generation")
+                try:
+                    segment = resp.json()
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise AbortResumeError("vLLM returned invalid JSON while resuming an interrupted generation") from exc
+                generation.append(segment)
+                if generation.should_resume and len(generation.completion_token_ids) == saved_token_count:
+                    no_progress_interruptions += 1
+                else:
+                    no_progress_interruptions = 0
+
+            return (
+                generation.merged_response(),
+                200,
+                {"interruption_count": generation.interruption_count},
+            )
+        except AbortResumeError as exc:
+            logger.error("Could not resume interrupted model turn: %s", exc)
+            interruption_count = generation.interruption_count if generation is not None else 1
+            return self._abort_resume_error(exc), 502, {"interruption_count": interruption_count}
+
+    @staticmethod
+    def _abort_resume_error(error: AbortResumeError) -> dict[str, Any]:
+        return {
+            "error": {
+                "message": str(error),
+                "type": "rllm_abort_resume_error",
+            }
+        }
 
     # ------------------------------------------------------------------
     # Cumulative token mode
@@ -311,6 +429,7 @@ class ReverseProxy:
     ) -> Response:
         """Non-streaming cumulative turn: send non-streaming to vLLM, return JSON."""
         t0 = time.perf_counter()
+        resume_metadata: dict[str, Any] | None = None
 
         worker = self.router.route(session_id)
         url = self._build_url(worker.api_url, "/v1/completions", "")
@@ -325,31 +444,55 @@ class ReverseProxy:
             )
             content = resp.content
             status_code = resp.status_code
+
+            try:
+                response_body = json.loads(content)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                response_body = {}
+
+            if self.resume_aborted_requests and status_code < 400 and is_aborted_response(response_body):
+                response_body, status_code, resume_metadata = await self._resume_aborted_generation(
+                    request=request,
+                    worker_api_url=worker.api_url,
+                    headers=headers,
+                    request_body=request_body,
+                    first_response=response_body,
+                    session_id=session_id,
+                )
         finally:
             self.router.release(worker.url)
 
-        try:
-            response_body = json.loads(content)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            response_body = {}
-
         latency_ms = (time.perf_counter() - t0) * 1000
 
-        prompt_token_ids = extract_prompt_token_ids(response_body) or token_ids
-        completion_token_ids = extract_completion_token_ids(response_body)
+        if status_code < 400:
+            prompt_token_ids = extract_prompt_token_ids(response_body) or token_ids
+            completion_token_ids = extract_completion_token_ids(response_body)
 
-        acc.ingest_turn(prompt_token_ids, completion_token_ids)
-        acc.update_prefix(request_body.get("messages", []))
+            acc.ingest_turn(prompt_token_ids, completion_token_ids)
+            acc.update_prefix(request_body.get("messages", []))
 
         # Translate to chat format
         choices = response_body.get("choices") or []
         if choices:
             first_choice = choices[0]
-            first_choice["message"] = {"role": "assistant", "content": first_choice.pop("text", "")}
-        response_body["object"] = "chat.completion"
+            if "message" not in first_choice:
+                first_choice["message"] = {
+                    "role": "assistant",
+                    "content": first_choice.pop("text", ""),
+                }
+            else:
+                first_choice.pop("text", None)
+            response_body["object"] = "chat.completion"
 
         if session_id and response_body:
-            trace = build_trace_record(session_id, request_body, response_body, latency_ms, weight_version=request.state.weight_version)
+            trace = build_trace_record(
+                session_id,
+                request_body,
+                response_body,
+                latency_ms,
+                metadata=resume_metadata,
+                weight_version=request.state.weight_version,
+            )
             await self._persist(trace)
 
         sanitized = response_body

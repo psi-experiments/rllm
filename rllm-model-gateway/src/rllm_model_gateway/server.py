@@ -116,6 +116,7 @@ def create_app(
     config: GatewayConfig | None = None,
     store: TraceStore | None = None,
     local_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    token_decoder: Callable[[list[int]], str] | None = None,
 ) -> FastAPI:
     """Create and return a fully configured FastAPI application."""
     if config is None:
@@ -151,19 +152,29 @@ def create_app(
     # Build the renderer for cumulative token mode. The renderer owns
     # message↔token conversion and the cross-turn bridge (see
     # token_accumulator.TokenAccumulator). The tokenizer is loaded from the
-    # served model path (``config.model``), which we assume is a complete,
-    # unmodified HuggingFace checkpoint.
+    # tokenizer checkpoint (``config.tokenizer_path`` when supplied, otherwise
+    # ``config.model``), which we assume is a complete, unmodified HuggingFace
+    # checkpoint. ``config.model`` remains the public model name forwarded to
+    # the inference server.
     renderer = None
-    if config.cumulative_token_mode:
-        if not config.model:
-            raise ValueError("cumulative_token_mode=True requires 'model' to be set in GatewayConfig (path to the served HuggingFace checkpoint).")
+    tokenizer = None
+    needs_tokenizer = config.cumulative_token_mode or (config.resume_aborted_requests and token_decoder is None)
+    if needs_tokenizer:
+        tokenizer_source = config.tokenizer_path or config.model
+        if not tokenizer_source:
+            raise ValueError("cumulative_token_mode or resume_aborted_requests requires 'tokenizer_path' or 'model' to be set in GatewayConfig")
         try:
-            from renderers import create_renderer
             from transformers import AutoTokenizer
         except ImportError as err:
-            raise ImportError("cumulative_token_mode requires the 'renderers' and 'transformers' packages. Install them with: pip install renderers transformers") from err
+            raise ImportError("cumulative_token_mode and resume_aborted_requests require transformers. Install it with: pip install transformers") from err
 
-        tokenizer = AutoTokenizer.from_pretrained(config.model)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+
+    if config.cumulative_token_mode:
+        try:
+            from renderers import create_renderer
+        except ImportError as err:
+            raise ImportError("cumulative_token_mode requires the 'renderers' package. Install it with: pip install renderers") from err
 
         # renderer_family="auto" lets renderers resolve the family by matching the
         # tokenizer's name_or_path against its MODEL_RENDERER_MAP. This succeeds
@@ -194,6 +205,14 @@ def create_app(
                 "main/renderers/base.py"
             )
 
+    if config.resume_aborted_requests and token_decoder is None:
+        assert tokenizer is not None
+
+        def _decode_token_ids(token_ids: list[int]) -> str:
+            return tokenizer.decode(token_ids, skip_special_tokens=False)
+
+        token_decoder = _decode_token_ids
+
     proxy = ReverseProxy(
         router=router,
         store=store,
@@ -202,6 +221,10 @@ def create_app(
         local_handler=local_handler,
         cumulative_token_mode=config.cumulative_token_mode,
         renderer=renderer,
+        resume_aborted_requests=config.resume_aborted_requests,
+        abort_resume_tool_parser=config.abort_resume_tool_parser,
+        token_decoder=token_decoder,
+        max_consecutive_no_progress_resumes=config.max_consecutive_no_progress_resumes,
     )
     sessions = SessionManager(store)
 
@@ -477,6 +500,7 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         "RLLM_GATEWAY_DB_PATH": "db_path",
         "RLLM_GATEWAY_LOG_LEVEL": "log_level",
         "RLLM_GATEWAY_STORE": "store_worker",
+        "RLLM_GATEWAY_TOKENIZER_PATH": "tokenizer_path",
     }
     for env_key, config_key in env_map.items():
         val = os.environ.get(env_key)
@@ -499,10 +523,18 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         data["store_worker"] = args.store
     if getattr(args, "model", None) is not None:
         data["model"] = args.model
+    if getattr(args, "tokenizer_path", None) is not None:
+        data["tokenizer_path"] = args.tokenizer_path
     if getattr(args, "cumulative_token_mode", False):
         data["cumulative_token_mode"] = True
     if getattr(args, "renderer_family", None) is not None:
         data["renderer_family"] = args.renderer_family
+    if getattr(args, "resume_aborted_requests", False):
+        data["resume_aborted_requests"] = True
+    if getattr(args, "abort_resume_tool_parser", None) is not None:
+        data["abort_resume_tool_parser"] = args.abort_resume_tool_parser
+    if getattr(args, "max_consecutive_no_progress_resumes", None) is not None:
+        data["max_consecutive_no_progress_resumes"] = args.max_consecutive_no_progress_resumes
 
     # Workers from CLI --worker flags (WorkerConfig validator auto-splits URLs)
     worker_urls = getattr(args, "worker", None) or []
@@ -538,10 +570,16 @@ def main() -> None:
         help="If set, the gateway rewrites every request body's 'model' field to this value before forwarding.",
     )
     parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help=("Optional local HuggingFace checkpoint used for tokenizer loading. The public --model name is still forwarded to inference workers."),
+    )
+    parser.add_argument(
         "--cumulative-token-mode",
         action="store_true",
         default=False,
-        help="Enable cumulative token mode for drift-free multi-turn RL training. Loads the tokenizer from --model (the served HuggingFace checkpoint).",
+        help="Enable cumulative token mode for drift-free multi-turn RL training. Loads the tokenizer from --tokenizer-path, falling back to --model.",
     )
     parser.add_argument(
         "--renderer-family",
@@ -552,6 +590,24 @@ def main() -> None:
         "is a huggingface model id, but if --model is a local path, you must explicitly set it. "
         "Check the supported model families in MODEL_RENDERER_MAP of "
         "https://github.com/PrimeIntellect-ai/renderers/blob/main/renderers/base.py",
+    )
+    parser.add_argument(
+        "--resume-aborted-requests",
+        action="store_true",
+        default=False,
+        help=("Resume non-streaming vLLM generations that are interrupted by a fully async weight update. Loads the tokenizer from --tokenizer-path, falling back to --model."),
+    )
+    parser.add_argument(
+        "--abort-resume-tool-parser",
+        type=str,
+        default=None,
+        help=("vLLM tool parser whose non-streaming output contract must be reconstructed after a resumed request (hermes or hermes)."),
+    )
+    parser.add_argument(
+        "--max-consecutive-no-progress-resumes",
+        type=int,
+        default=None,
+        help="Maximum consecutive interrupted responses without new tokens before abort-resume returns an error.",
     )
 
     args = parser.parse_args()

@@ -161,6 +161,12 @@ class GatewayManager:
         self.public_url, self.tunnel_backend = parse_tunnel(gw_cfg.get("tunnel", None))
         # The gateway always pins ``body.model`` to whatever the trainer is serving
         self.model: str | None = config.get("model", {}).get("name", None)
+        # The public model name above is not necessarily resolvable by an
+        # offline Hugging Face client. Prefer the exact checkpoint path already
+        # resolved by the VERL launcher whenever the gateway needs a tokenizer.
+        configured_tokenizer_path = gw_cfg.get("tokenizer_path", None)
+        actor_model_path = config.get("actor_rollout_ref", {}).get("model", {}).get("path", None)
+        self.tokenizer_path: str | None = configured_tokenizer_path or actor_model_path or self.model
 
         # Cumulative token mode: drift-free multi-turn token forwarding. The
         # gateway loads the tokenizer from the served model path. renderers
@@ -168,6 +174,19 @@ class GatewayManager:
         # renderer_family must be set explicitly (e.g. "qwen3", "glm-5").
         self.cumulative_token_mode: bool = gw_cfg.get("cumulative_token_mode", False)
         self.renderer_family: str = gw_cfg.get("renderer_family", "auto")
+
+        # AgentFlow model calls go through this OpenAI-compatible gateway and
+        # therefore bypass VERL's direct FullyAsyncLLMServerClient. Mirror its
+        # partial-rollout behavior here whenever fully async interruption is on.
+        async_cfg = config.rllm.get("async_training", {})
+        auto_resume = bool(async_cfg.get("enable", False) and async_cfg.get("partial_rollout", False))
+        configured_resume = gw_cfg.get("resume_aborted_requests", None)
+        self.resume_aborted_requests: bool = auto_resume if configured_resume is None else bool(configured_resume)
+        rollout_cfg = config.get("actor_rollout_ref", {}).get("rollout", {})
+        vllm_engine_kwargs = rollout_cfg.get("engine_kwargs", {}).get("vllm", {})
+        configured_tool_parser = gw_cfg.get("abort_resume_tool_parser", None)
+        self.abort_resume_tool_parser: str | None = configured_tool_parser if configured_tool_parser is not None else vllm_engine_kwargs.get("tool_call_parser", None)
+        self.max_consecutive_no_progress_resumes: int = gw_cfg.get("max_consecutive_no_progress_resumes", 120)
 
         self.mode = mode
 
@@ -357,10 +376,27 @@ class GatewayManager:
             cmd.extend(["--db-path", self.db_path])
         if self.model:
             cmd.extend(["--model", self.model])
+        if self.tokenizer_path:
+            cmd.extend(["--tokenizer-path", self.tokenizer_path])
         if self.cumulative_token_mode:
             cmd.append("--cumulative-token-mode")
             if self.renderer_family != "auto":
                 cmd.extend(["--renderer-family", self.renderer_family])
+        if self.resume_aborted_requests:
+            cmd.append("--resume-aborted-requests")
+            cmd.extend(
+                [
+                    "--max-consecutive-no-progress-resumes",
+                    str(self.max_consecutive_no_progress_resumes),
+                ]
+            )
+            if self.abort_resume_tool_parser:
+                cmd.extend(
+                    [
+                        "--abort-resume-tool-parser",
+                        self.abort_resume_tool_parser,
+                    ]
+                )
 
         logger.info("Starting gateway subprocess: %s", " ".join(cmd))
         # Inherit parent's stdout/stderr so gateway logs are visible for debugging.
@@ -396,10 +432,14 @@ class GatewayManager:
             db_path=self.db_path,
             store_worker=self.store,
             model=self.model,
+            tokenizer_path=self.tokenizer_path,
             add_logprobs=self.add_logprobs,
             add_return_token_ids=self.add_return_token_ids,
             cumulative_token_mode=self.cumulative_token_mode,
             renderer_family=self.renderer_family,
+            resume_aborted_requests=(self.resume_aborted_requests and local_handler is None),
+            abort_resume_tool_parser=self.abort_resume_tool_parser,
+            max_consecutive_no_progress_resumes=self.max_consecutive_no_progress_resumes,
         )
         app = create_app(config=gw_config, local_handler=local_handler)
 

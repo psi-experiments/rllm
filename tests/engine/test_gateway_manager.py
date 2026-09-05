@@ -1,5 +1,7 @@
 """Unit tests for GatewayManager store-backend selection and validation."""
 
+from types import SimpleNamespace
+
 import pytest
 from omegaconf import OmegaConf
 
@@ -41,6 +43,146 @@ class TestGatewayStoreValidation:
     def test_memory_with_db_path_raises(self):
         with pytest.raises(ValueError, match="db_path is set but store='memory'"):
             GatewayManager(_make_config(store="memory", db_path="/tmp/x.db"), mode="thread")
+
+
+class TestGatewayAbortResume:
+    @staticmethod
+    def _config(
+        *,
+        enabled: bool,
+        partial_rollout: bool,
+        gateway_override=None,
+    ):
+        gateway = {}
+        if gateway_override is not None:
+            gateway["resume_aborted_requests"] = gateway_override
+        return OmegaConf.create(
+            {
+                "model": {"name": "Qwen/Qwen3-8B"},
+                "rllm": {
+                    "gateway": gateway,
+                    "async_training": {
+                        "enable": enabled,
+                        "partial_rollout": partial_rollout,
+                    },
+                },
+                "actor_rollout_ref": {
+                    "model": {
+                        "path": "/models/hf/hub/models--Qwen--Qwen3-8B/snapshots/exact",
+                    },
+                    "rollout": {
+                        "engine_kwargs": {
+                            "vllm": {
+                                "tool_call_parser": "hermes",
+                            }
+                        }
+                    },
+                },
+            }
+        )
+
+    def test_enabled_automatically_for_fully_async_partial_rollouts(self):
+        gateway = GatewayManager(
+            self._config(enabled=True, partial_rollout=True),
+            mode="process",
+        )
+        assert gateway.resume_aborted_requests is True
+        assert gateway.abort_resume_tool_parser == "hermes"
+        assert gateway.model == "Qwen/Qwen3-8B"
+        assert gateway.tokenizer_path.endswith("/snapshots/exact")
+
+    def test_explicit_tokenizer_path_overrides_actor_model_path(self):
+        config = self._config(enabled=True, partial_rollout=True)
+        config.rllm.gateway.tokenizer_path = "/models/tokenizer-only"
+        gateway = GatewayManager(config, mode="process")
+        assert gateway.tokenizer_path == "/models/tokenizer-only"
+
+    def test_no_progress_resume_limit_is_configurable(self):
+        config = self._config(enabled=True, partial_rollout=True)
+        config.rllm.gateway.max_consecutive_no_progress_resumes = 7
+
+        gateway = GatewayManager(config, mode="process")
+
+        assert gateway.max_consecutive_no_progress_resumes == 7
+
+    def test_process_mode_forwards_no_progress_resume_limit(self, monkeypatch):
+        config = self._config(enabled=True, partial_rollout=True)
+        config.rllm.gateway.max_consecutive_no_progress_resumes = 7
+        gateway = GatewayManager(config, mode="process")
+        gateway._client = SimpleNamespace(health=lambda: None)
+        commands = []
+
+        monkeypatch.setattr(
+            "rllm.gateway.manager.subprocess.Popen",
+            lambda command: commands.append(command) or SimpleNamespace(),
+        )
+
+        gateway._start_process()
+
+        command = commands[0]
+        option_index = command.index("--max-consecutive-no-progress-resumes")
+        assert command[option_index + 1] == "7"
+
+    def test_thread_mode_forwards_no_progress_resume_limit(self, monkeypatch):
+        import uvicorn
+        from rllm_model_gateway import server as gateway_server
+
+        config = self._config(enabled=True, partial_rollout=True)
+        config.rllm.gateway.max_consecutive_no_progress_resumes = 7
+        gateway = GatewayManager(config, mode="thread")
+        captured = {}
+
+        def capture_config(*, config, local_handler):
+            captured["config"] = config
+            return SimpleNamespace()
+
+        class FakeServer:
+            started = True
+
+            def run(self):
+                pass
+
+        class FakeThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        monkeypatch.setattr(gateway_server, "create_app", capture_config)
+        monkeypatch.setattr(uvicorn, "Config", lambda *args, **kwargs: SimpleNamespace())
+        monkeypatch.setattr(uvicorn, "Server", lambda config: FakeServer())
+        monkeypatch.setattr("rllm.gateway.manager.threading.Thread", FakeThread)
+
+        gateway._start_thread()
+
+        assert captured["config"].max_consecutive_no_progress_resumes == 7
+
+    @pytest.mark.parametrize(
+        ("enabled", "partial_rollout"),
+        [(False, False), (True, False), (False, True)],
+    )
+    def test_disabled_unless_both_async_switches_are_on(
+        self,
+        enabled,
+        partial_rollout,
+    ):
+        gateway = GatewayManager(
+            self._config(enabled=enabled, partial_rollout=partial_rollout),
+            mode="process",
+        )
+        assert gateway.resume_aborted_requests is False
+
+    def test_explicit_override_can_disable_automatic_resume(self):
+        gateway = GatewayManager(
+            self._config(
+                enabled=True,
+                partial_rollout=True,
+                gateway_override=False,
+            ),
+            mode="process",
+        )
+        assert gateway.resume_aborted_requests is False
 
 
 class TestContainerReachableUrl:
