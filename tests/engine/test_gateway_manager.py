@@ -71,6 +71,7 @@ class TestGatewayAbortResume:
                         "path": "/models/hf/hub/models--Qwen--Qwen3-8B/snapshots/exact",
                     },
                     "rollout": {
+                        "logprobs_mode": "processed_logprobs",
                         "engine_kwargs": {
                             "vllm": {
                                 "tool_call_parser": "psi_hermes_concurrent",
@@ -90,6 +91,15 @@ class TestGatewayAbortResume:
         assert gateway.abort_resume_tool_parser == "psi_hermes_concurrent"
         assert gateway.model == "Qwen/Qwen3-8B"
         assert gateway.tokenizer_path.endswith("/snapshots/exact")
+        assert gateway.logprobs_mode == "processed_logprobs"
+
+    def test_missing_logprobs_mode_remains_unknown(self):
+        config = self._config(enabled=True, partial_rollout=True)
+        del config.actor_rollout_ref.rollout.logprobs_mode
+
+        gateway = GatewayManager(config, mode="process")
+
+        assert gateway.logprobs_mode is None
 
     def test_explicit_tokenizer_path_overrides_actor_model_path(self):
         config = self._config(enabled=True, partial_rollout=True)
@@ -122,6 +132,8 @@ class TestGatewayAbortResume:
         command = commands[0]
         option_index = command.index("--max-consecutive-no-progress-resumes")
         assert command[option_index + 1] == "7"
+        mode_index = command.index("--logprobs-mode")
+        assert command[mode_index + 1] == "processed_logprobs"
 
     def test_thread_mode_forwards_no_progress_resume_limit(self, monkeypatch):
         import uvicorn
@@ -157,6 +169,7 @@ class TestGatewayAbortResume:
         gateway._start_thread()
 
         assert captured["config"].max_consecutive_no_progress_resumes == 7
+        assert captured["config"].logprobs_mode == "processed_logprobs"
 
     @pytest.mark.parametrize(
         ("enabled", "partial_rollout"),

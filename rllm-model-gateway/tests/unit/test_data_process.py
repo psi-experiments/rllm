@@ -1,5 +1,7 @@
 """Tests for token/logprob extraction and trace record building."""
 
+import pytest
+from pydantic import ValidationError
 from rllm_model_gateway.data_process import (
     build_trace_record,
     build_trace_record_from_chunks,
@@ -10,6 +12,7 @@ from rllm_model_gateway.data_process import (
     extract_prompt_token_ids,
     strip_vllm_fields,
 )
+from rllm_model_gateway.models import TraceRecord
 
 # ------------------------------------------------------------------
 # Extraction helpers
@@ -61,6 +64,40 @@ class TestExtractLogprobs:
 
     def test_no_choices(self):
         assert extract_logprobs({}) == []
+
+
+class TestTraceRecordLogprobCompatibility:
+    @pytest.mark.parametrize("mode", [None, "raw_logprobs", "raw_logits"])
+    def test_legacy_or_unrelated_sparse_logprobs_remain_loadable(self, mode):
+        trace = TraceRecord(
+            trace_id="legacy-trace",
+            session_id="legacy-session",
+            completion_token_ids=[10, 11],
+            logprobs=[float("nan")],
+            logprobs_mode=mode,
+        )
+
+        assert len(trace.logprobs) == 1
+
+    def test_processed_logprobs_require_full_token_alignment(self):
+        with pytest.raises(ValidationError, match="one logprob per completion token"):
+            TraceRecord(
+                trace_id="processed-trace",
+                session_id="processed-session",
+                completion_token_ids=[10, 11],
+                logprobs=[-0.1],
+                logprobs_mode="processed_logprobs",
+            )
+
+    def test_processed_logprobs_require_finite_values(self):
+        with pytest.raises(ValidationError, match="must be finite"):
+            TraceRecord(
+                trace_id="processed-trace",
+                session_id="processed-session",
+                completion_token_ids=[10],
+                logprobs=[float("nan")],
+                logprobs_mode="processed_logprobs",
+            )
 
 
 class TestExtractDeltaTokenIds:
@@ -144,6 +181,9 @@ class TestBuildTraceRecord:
         request_body = {
             "model": "test-model",
             "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
         }
         response_body = {
             "model": "test-model",
@@ -164,13 +204,29 @@ class TestBuildTraceRecord:
             ],
             "usage": {"prompt_tokens": 3, "completion_tokens": 2},
         }
-        trace = build_trace_record("session-1", request_body, response_body, 100.0)
+        trace = build_trace_record(
+            "session-1",
+            request_body,
+            response_body,
+            100.0,
+            weight_version=7,
+            logprobs_mode="processed_logprobs",
+        )
 
         assert trace.session_id == "session-1"
         assert trace.model == "test-model"
         assert trace.prompt_token_ids == [1, 2, 3]
         assert trace.completion_token_ids == [10, 11]
         assert trace.logprobs == [-0.5, -0.1]
+        assert trace.logprobs_mode == "processed_logprobs"
+        assert trace.behavior_sampling_params == {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+        }
+        assert [span.model_dump() for span in trace.generator_version_spans] == [
+            {"start": 0, "end": 2, "weight_version": 7}
+        ]
         assert trace.finish_reason == "stop"
         assert trace.token_counts == {"prompt": 3, "completion": 2}
         assert trace.messages == [{"role": "user", "content": "hello"}]
@@ -223,12 +279,23 @@ class TestBuildTraceRecord:
                 "usage": {"prompt_tokens": 3, "completion_tokens": 2},
             },
         ]
-        trace = build_trace_record_from_chunks("session-2", request_body, chunks, 200.0)
+        trace = build_trace_record_from_chunks(
+            "session-2",
+            request_body,
+            chunks,
+            200.0,
+            weight_version=8,
+            logprobs_mode="processed_logprobs",
+        )
 
         assert trace.session_id == "session-2"
         assert trace.prompt_token_ids == [1, 2, 3]
         assert trace.completion_token_ids == [10, 11]
         assert trace.logprobs == [-0.5, -0.3]
+        assert trace.logprobs_mode == "processed_logprobs"
+        assert [span.model_dump() for span in trace.generator_version_spans] == [
+            {"start": 0, "end": 2, "weight_version": 8}
+        ]
         assert trace.response_message["content"] == "Hi there"
         assert trace.finish_reason == "stop"
         assert trace.token_counts == {"prompt": 3, "completion": 2}

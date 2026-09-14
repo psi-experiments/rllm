@@ -1,7 +1,11 @@
 import pytest
+import torch
 from omegaconf import OmegaConf
 
-from rllm.trainer.verl.verl_backend import VerlBackend
+from rllm.trainer.verl.verl_backend import (
+    VerlBackend,
+    compute_support_aware_rollout_correction_weights,
+)
 
 
 def _make_config(*, remote_enabled: bool, partial_rollout: bool):
@@ -48,3 +52,35 @@ def test_partial_rollout_disabled_with_remote_runtime_ok():
 def test_partial_rollout_without_remote_runtime_ok():
     be = _backend(_make_config(remote_enabled=False, partial_rollout=True))
     be.validate_config()
+
+
+def test_old_policy_out_of_support_actions_are_excluded_before_is_statistics():
+    weights, metrics = compute_support_aware_rollout_correction_weights(
+        torch.tensor([[0.0, 10.0, 0.0, -10.0]]),
+        torch.tensor([[1, 1, 1, 0]]),
+        torch.tensor([[True, False, True, False]]),
+        rollout_is="token",
+        rollout_is_threshold=2.0,
+    )
+
+    torch.testing.assert_close(weights, torch.tensor([[1.0, 0.0, 1.0, 0.0]]))
+    assert metrics["old_policy_out_of_support_fraction"] == pytest.approx(1 / 3)
+    assert metrics["rollout_is_ratio_fraction_high"] == 0.0
+    assert metrics["rollout_is_mean"] == 1.0
+    assert metrics["rollout_is_eff_sample_size"] == pytest.approx(1.0)
+    assert metrics["rollout_is_metrics_defined"] == 1.0
+
+
+def test_fully_unsupported_old_policy_batch_has_zero_weights_and_defined_telemetry():
+    weights, metrics = compute_support_aware_rollout_correction_weights(
+        torch.tensor([[10.0, -10.0]]),
+        torch.tensor([[1, 1]]),
+        torch.tensor([[False, False]]),
+        rollout_is="token",
+        rollout_is_threshold=2.0,
+    )
+
+    torch.testing.assert_close(weights, torch.zeros_like(weights))
+    assert metrics["old_policy_out_of_support_fraction"] == 1.0
+    assert metrics["rollout_is_eff_sample_size"] == 0.0
+    assert metrics["rollout_is_metrics_defined"] == 0.0

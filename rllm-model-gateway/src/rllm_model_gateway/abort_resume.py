@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 import uuid
 from collections.abc import Callable
@@ -19,7 +20,9 @@ from rllm_model_gateway.data_process import (
     extract_completion_token_ids,
     extract_logprobs,
     extract_prompt_token_ids,
+    extract_weight_version,
 )
+from rllm_model_gateway.models import GeneratorVersionSpan, LogprobsMode
 
 TokenDecoder = Callable[[list[int]], str]
 
@@ -140,6 +143,8 @@ class AbortedGeneration:
         *,
         decoder: TokenDecoder,
         tool_parser: str | None,
+        weight_version: int | None,
+        logprobs_mode: LogprobsMode | None,
     ) -> None:
         if request_body.get("tools") and tool_parser not in _SUPPORTED_TOOL_PARSERS:
             raise AbortResumeError(f"Unsupported abort-resume tool parser {tool_parser!r}; supported parsers: {sorted(_SUPPORTED_TOOL_PARSERS)}")
@@ -151,6 +156,7 @@ class AbortedGeneration:
         self.first_response = copy.deepcopy(first_response)
         self.decoder = decoder
         self.tool_parser = tool_parser
+        self.logprobs_mode = logprobs_mode
         self.prompt_token_ids = extract_prompt_token_ids(first_response)
         if not self.prompt_token_ids:
             raise AbortResumeError("Interrupted response did not include prompt_token_ids; token-exact continuation is impossible")
@@ -159,11 +165,12 @@ class AbortedGeneration:
         self.original_max_tokens = int(configured_max) if configured_max is not None else None
         self.completion_token_ids: list[int] = []
         self.logprob_entries: list[dict[str, Any]] = []
+        self.generator_version_spans: list[GeneratorVersionSpan] = []
         self.last_response: dict[str, Any] = {}
         self.interruption_count = 0
-        self.append(first_response)
+        self.append(first_response, weight_version=weight_version)
 
-    def append(self, response: dict[str, Any]) -> None:
+    def append(self, response: dict[str, Any], *, weight_version: int | None) -> None:
         """Append one upstream segment, validating token/logprob alignment."""
         _choice(response)
         token_ids = extract_completion_token_ids(response)
@@ -173,6 +180,25 @@ class AbortedGeneration:
             raise AbortResumeError(f"Interrupted response did not include one logprob per generated token ({len(logprob_values)} logprobs for {len(token_ids)} tokens)")
         if token_ids and len(entries) != len(token_ids):
             raise AbortResumeError("Interrupted response logprob metadata did not align with its token IDs")
+        if not all(math.isfinite(value) for value in logprob_values):
+            raise AbortResumeError("Interrupted response included a non-finite generated-token logprob")
+
+        response_weight_version = extract_weight_version(response)
+        if response_weight_version is not None:
+            weight_version = response_weight_version
+        span_start = len(self.completion_token_ids)
+        span_end = span_start + len(token_ids)
+        if token_ids:
+            if self.generator_version_spans and self.generator_version_spans[-1].weight_version == weight_version:
+                self.generator_version_spans[-1].end = span_end
+            else:
+                self.generator_version_spans.append(
+                    GeneratorVersionSpan(
+                        start=span_start,
+                        end=span_end,
+                        weight_version=weight_version,
+                    )
+                )
         self.completion_token_ids.extend(token_ids)
         self.logprob_entries.extend(entries)
         self.last_response = copy.deepcopy(response)

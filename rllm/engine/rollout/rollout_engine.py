@@ -22,6 +22,14 @@ class ModelOutput:
     completion_ids: list[int] | None = None
     multi_modal_inputs: dict[str, list] | None = None
     logprobs: list[float] | None = None  # completion logprobs
+    # Sampling semantics declared by the inference server. Importance
+    # sampling must require ``processed_logprobs`` rather than guessing when
+    # this is absent.
+    logprobs_mode: str | None = None
+    behavior_sampling_params: dict | None = None
+    # Half-open completion-token spans identifying the generator version for
+    # interrupted/resumed turns.
+    generator_version_spans: list[dict[str, int | None]] | None = None
     prompt_logprobs: list[float] | None = None  # prompt logprobs aligned to prompt_ids
     routing_matrices: list[str] | None = None  # per-token routing matrices (R3, transient)
     prompt_length: int = 0
@@ -40,6 +48,9 @@ class ModelOutput:
             "completion_ids": self.completion_ids,
             "multi_modal_inputs": self.multi_modal_inputs,
             "logprobs": self.logprobs,
+            "logprobs_mode": self.logprobs_mode,
+            "behavior_sampling_params": self.behavior_sampling_params,
+            "generator_version_spans": self.generator_version_spans,
             "prompt_logprobs": self.prompt_logprobs,
             "routing_matrices": self.routing_matrices,
             "prompt_length": self.prompt_length,
@@ -62,6 +73,9 @@ class ModelOutput:
             completion_ids=data.get("completion_ids"),
             multi_modal_inputs=data.get("multi_modal_inputs"),
             logprobs=data.get("logprobs"),
+            logprobs_mode=data.get("logprobs_mode"),
+            behavior_sampling_params=data.get("behavior_sampling_params"),
+            generator_version_spans=data.get("generator_version_spans"),
             prompt_logprobs=data.get("prompt_logprobs"),
             routing_matrices=data.get("routing_matrices"),
             prompt_length=data.get("prompt_length", 0),

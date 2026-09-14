@@ -42,6 +42,10 @@ def trace_record_to_step(trace: TraceRecord) -> Step:
     # Extract tool_calls from response message (OpenAI format)
     raw_tool_calls = trace.response_message.get("tool_calls")
     tool_calls = _parse_openai_tool_calls(raw_tool_calls) if raw_tool_calls else None
+    generator_version_spans = [
+        span.model_dump() for span in trace.generator_version_spans
+    ]
+    behavior_sampling_params = dict(trace.behavior_sampling_params)
 
     model_output = ModelOutput(
         content=content,
@@ -50,6 +54,9 @@ def trace_record_to_step(trace: TraceRecord) -> Step:
         prompt_ids=trace.prompt_token_ids,
         completion_ids=trace.completion_token_ids,
         logprobs=trace.logprobs or [],
+        logprobs_mode=trace.logprobs_mode,
+        behavior_sampling_params=behavior_sampling_params,
+        generator_version_spans=generator_version_spans,
         routing_matrices=trace.routing_matrices,
         prompt_length=len(trace.prompt_token_ids),
         completion_length=len(trace.completion_token_ids),
@@ -61,6 +68,11 @@ def trace_record_to_step(trace: TraceRecord) -> Step:
     chat_completions = list(trace.messages)
     chat_completions.append(trace.response_message)
 
+    metadata = dict(trace.metadata)
+    metadata["logprobs_mode"] = trace.logprobs_mode
+    metadata["behavior_sampling_params"] = behavior_sampling_params
+    metadata["generator_version_spans"] = generator_version_spans
+
     return Step(
         id=trace.trace_id,
         chat_completions=chat_completions,
@@ -68,7 +80,7 @@ def trace_record_to_step(trace: TraceRecord) -> Step:
         model_response=content,
         output=content,
         thought=reasoning,
-        metadata=trace.metadata,
+        metadata=metadata,
         weight_version=trace.weight_version,
     )
 

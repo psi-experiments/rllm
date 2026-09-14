@@ -1,9 +1,31 @@
 """Pydantic data models for the rllm-model-gateway."""
 
-from typing import Any
+import math
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, model_validator
+
+LogprobsMode = Literal[
+    "raw_logprobs",
+    "processed_logprobs",
+    "raw_logits",
+    "processed_logits",
+]
+
+
+class GeneratorVersionSpan(BaseModel):
+    """Generator version for one half-open completion-token interval."""
+
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    weight_version: int | None = None
+
+    @model_validator(mode="after")
+    def _end_follows_start(self) -> "GeneratorVersionSpan":
+        if self.end <= self.start:
+            raise ValueError("generator version span end must be greater than start")
+        return self
 
 
 class TraceRecord(BaseModel):
@@ -19,6 +41,20 @@ class TraceRecord(BaseModel):
     response_message: dict[str, Any] = Field(default_factory=dict)
     completion_token_ids: list[int] = Field(default_factory=list)
     logprobs: list[float] | None = None
+    # Semantics of ``logprobs`` as configured on the upstream vLLM server.
+    # ``None`` means unknown and must not be assumed to be behavior-policy
+    # probabilities by a training consumer.
+    logprobs_mode: LogprobsMode | None = None
+    # Forwarded request-side sampling controls used by the behavior policy.
+    # Omitted controls still use the inference worker's defaults. These are
+    # diagnostic inputs to distribution matching; they do not by themselves
+    # guarantee that trainer recomputation applies the same logits processors
+    # as vLLM.
+    behavior_sampling_params: dict[str, Any] = Field(default_factory=dict)
+    # Compact policy lineage for completion tokens. Offsets are half-open and
+    # relative to ``completion_token_ids``. A turn interrupted by weight sync
+    # may contain more than one span.
+    generator_version_spans: list[GeneratorVersionSpan] = Field(default_factory=list)
     routing_matrices: list[str] | None = None
     finish_reason: str | None = None
     weight_version: int | None = None
@@ -29,6 +65,36 @@ class TraceRecord(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     raw_request: dict[str, Any] | None = None
     raw_response: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _validate_token_lineage(self) -> "TraceRecord":
+        # Old gateway records did not declare logprob semantics and may contain
+        # sparse diagnostic values. Keep those records loadable. The strict
+        # one-value-per-token contract is required only when a record claims
+        # its values are processed behavior-policy logprobs.
+        if self.logprobs_mode == "processed_logprobs" and self.logprobs is not None:
+            if len(self.logprobs) != len(self.completion_token_ids):
+                raise ValueError("processed trace must contain one logprob per completion token")
+            if not all(math.isfinite(value) for value in self.logprobs):
+                raise ValueError("processed trace generated-token logprobs must be finite")
+
+        if not self.generator_version_spans:
+            return self
+        if not self.completion_token_ids:
+            raise ValueError("generator version spans require completion tokens")
+
+        expected_start = 0
+        previous_version: int | None = None
+        for index, span in enumerate(self.generator_version_spans):
+            if span.start != expected_start:
+                raise ValueError("generator version spans must be contiguous and start at token offset 0")
+            if index > 0 and span.weight_version == previous_version:
+                raise ValueError("adjacent generator version spans with the same version must be compacted")
+            expected_start = span.end
+            previous_version = span.weight_version
+        if expected_start != len(self.completion_token_ids):
+            raise ValueError("generator version spans must cover every completion token")
+        return self
 
 
 def _split_worker_url(raw: str) -> dict[str, str]:
@@ -115,6 +181,10 @@ class GatewayConfig(BaseModel):
     db_path: str | None = None
     store_worker: str = "memory"
     add_logprobs: bool = True
+    # vLLM configures this at server startup, not per request. The gateway
+    # records the declared mode so training can fail closed when the semantics
+    # of captured values are unknown.
+    logprobs_mode: LogprobsMode | None = None
     add_return_token_ids: bool = True
     strip_vllm_fields: bool = True
     routing_policy: str | None = None

@@ -28,7 +28,7 @@ from rllm_model_gateway.data_process import (
     extract_prompt_token_ids,
     strip_vllm_fields,
 )
-from rllm_model_gateway.models import TraceRecord
+from rllm_model_gateway.models import GeneratorVersionSpan, LogprobsMode, TraceRecord
 from rllm_model_gateway.session_router import SessionRouter
 from rllm_model_gateway.store.base import TraceStore
 from rllm_model_gateway.token_accumulator import (
@@ -98,6 +98,7 @@ class ReverseProxy:
         token_decoder: TokenDecoder | None = None,
         abort_resume_delay_s: float = 1.0,
         max_consecutive_no_progress_resumes: int = 120,
+        logprobs_mode: LogprobsMode | None = None,
     ) -> None:
         if max_consecutive_no_progress_resumes < 1:
             raise ValueError("max_consecutive_no_progress_resumes must be positive")
@@ -114,6 +115,7 @@ class ReverseProxy:
         self.token_decoder = token_decoder
         self.abort_resume_delay_s = abort_resume_delay_s
         self.max_consecutive_no_progress_resumes = max_consecutive_no_progress_resumes
+        self.logprobs_mode = logprobs_mode
         self.weight_version: int | None = None
         self._http: httpx.AsyncClient | None = None
         self._pending_traces: set[asyncio.Task[None]] = set()
@@ -265,6 +267,8 @@ class ReverseProxy:
                 latency_ms,
                 metadata=resume_metadata,
                 weight_version=request.state.weight_version,
+                logprobs_mode=self.logprobs_mode,
+                generator_version_spans=self._generator_version_spans(resume_metadata),
             )
             await self._persist(trace)
 
@@ -321,6 +325,8 @@ class ReverseProxy:
                 first_response,
                 decoder=self.token_decoder,
                 tool_parser=self.abort_resume_tool_parser,
+                weight_version=request.state.weight_version,
+                logprobs_mode=self.logprobs_mode,
             )
             continuation_url = self._build_url(
                 worker_api_url,
@@ -339,6 +345,7 @@ class ReverseProxy:
                 await asyncio.sleep(self.abort_resume_delay_s)
                 continuation_body = generation.continuation_body()
                 saved_token_count = len(generation.completion_token_ids)
+                segment_weight_version = self.weight_version
                 resp = await self._send_with_retry(
                     method=request.method,
                     url=continuation_url,
@@ -351,7 +358,10 @@ class ReverseProxy:
                     segment = resp.json()
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     raise AbortResumeError("vLLM returned invalid JSON while resuming an interrupted generation") from exc
-                generation.append(segment)
+                generation.append(
+                    segment,
+                    weight_version=segment_weight_version,
+                )
                 if generation.should_resume and len(generation.completion_token_ids) == saved_token_count:
                     no_progress_interruptions += 1
                 else:
@@ -360,7 +370,13 @@ class ReverseProxy:
             return (
                 generation.merged_response(),
                 200,
-                {"interruption_count": generation.interruption_count},
+                {
+                    "interruption_count": generation.interruption_count,
+                    "generator_version_spans": [
+                        span.model_dump()
+                        for span in generation.generator_version_spans
+                    ],
+                },
             )
         except AbortResumeError as exc:
             logger.error("Could not resume interrupted model turn: %s", exc)
@@ -375,6 +391,17 @@ class ReverseProxy:
                 "type": "rllm_abort_resume_error",
             }
         }
+
+    @staticmethod
+    def _generator_version_spans(
+        resume_metadata: dict[str, Any] | None,
+    ) -> list[GeneratorVersionSpan] | None:
+        if not resume_metadata:
+            return None
+        spans = resume_metadata.get("generator_version_spans")
+        if spans is None:
+            return None
+        return [GeneratorVersionSpan.model_validate(span) for span in spans]
 
     # ------------------------------------------------------------------
     # Cumulative token mode
@@ -492,6 +519,8 @@ class ReverseProxy:
                 latency_ms,
                 metadata=resume_metadata,
                 weight_version=request.state.weight_version,
+                logprobs_mode=self.logprobs_mode,
+                generator_version_spans=self._generator_version_spans(resume_metadata),
             )
             await self._persist(trace)
 
@@ -628,7 +657,14 @@ class ReverseProxy:
                 # Ingest accumulated token data
                 if chunks:
                     latency_ms = (time.perf_counter() - t0) * 1000
-                    trace = build_trace_record_from_chunks(session_id, request_body, chunks, latency_ms, weight_version=request.state.weight_version)
+                    trace = build_trace_record_from_chunks(
+                        session_id,
+                        request_body,
+                        chunks,
+                        latency_ms,
+                        weight_version=request.state.weight_version,
+                        logprobs_mode=self.logprobs_mode,
+                    )
                     prompt_ids = trace.prompt_token_ids or token_ids
                     completion_ids = trace.completion_token_ids
 
@@ -754,7 +790,14 @@ class ReverseProxy:
                 # finally block may run during GeneratorExit, where await
                 # on real async I/O (e.g. aiosqlite) is not reliable.
                 if session_id and chunks:
-                    trace = build_trace_record_from_chunks(session_id, request_body, chunks, latency_ms, weight_version=request.state.weight_version)
+                    trace = build_trace_record_from_chunks(
+                        session_id,
+                        request_body,
+                        chunks,
+                        latency_ms,
+                        weight_version=request.state.weight_version,
+                        logprobs_mode=self.logprobs_mode,
+                    )
                     task = asyncio.create_task(
                         self._safe_store(
                             trace.trace_id,
@@ -796,7 +839,14 @@ class ReverseProxy:
 
         # Persist trace from the full response
         if session_id and response_body:
-            trace = build_trace_record(session_id, request_body, response_body, latency_ms, weight_version=weight_version)
+            trace = build_trace_record(
+                session_id,
+                request_body,
+                response_body,
+                latency_ms,
+                weight_version=weight_version,
+                logprobs_mode=self.logprobs_mode,
+            )
             await self._persist(trace)
 
         needs_strip_vllm = self.strip_vllm

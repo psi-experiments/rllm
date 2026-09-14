@@ -10,6 +10,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 from rllm_model_gateway import GatewayConfig, create_app
+from rllm_model_gateway.abort_resume import AbortedGeneration, AbortResumeError
 
 from tests.helpers.mock_vllm import MockVLLMServer
 
@@ -140,6 +141,7 @@ def _app(
         resume_aborted_requests=True,
         abort_resume_tool_parser=tool_parser,
         max_consecutive_no_progress_resumes=max_consecutive_no_progress_resumes,
+        logprobs_mode="processed_logprobs",
     )
     app = create_app(config, token_decoder=decoder)
     app.state.proxy.abort_resume_delay_s = 0
@@ -229,7 +231,99 @@ async def test_aborted_response_resumes_with_saved_tokens(
     assert len(traces) == 1
     assert traces[0]["completion_token_ids"] == [10, 11, 12, 13]
     assert traces[0]["logprobs"] == [-0.1, -0.2, -0.3, -0.4]
+    assert traces[0]["logprobs_mode"] == "processed_logprobs"
+    assert traces[0]["generator_version_spans"] == [
+        {"start": 0, "end": 4, "weight_version": None}
+    ]
     assert traces[0]["metadata"]["interruption_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_interrupted_trace_preserves_logprobs_and_generator_version_spans(
+    mock_vllm: MockVLLMServer,
+):
+    """A weight update between segments retains exact per-token lineage."""
+    first = _response(
+        prompt_ids=[1, 2],
+        token_ids=[10, 11],
+        logprobs=[-0.11, -0.22],
+        finish_reason="abort",
+        text="partial",
+        chat=True,
+    )
+    second = _response(
+        prompt_ids=[1, 2, 10, 11],
+        token_ids=[12, 13],
+        logprobs=[-0.33, -0.44],
+        finish_reason="stop",
+        text=" suffix",
+        chat=False,
+    )
+    mock_vllm.queue_responses(first, second)
+    app = _app(mock_vllm, lambda ids: "complete answer")
+    proxy = app.state.proxy
+    proxy.weight_version = 5
+    original_send = proxy._send_with_retry
+    request_count = 0
+
+    async def update_version_after_first_segment(*args, **kwargs):
+        nonlocal request_count
+        response = await original_send(*args, **kwargs)
+        request_count += 1
+        if request_count == 1:
+            proxy.weight_version = 6
+        return response
+
+    proxy._send_with_retry = update_version_after_first_segment
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/sessions/versioned/v1/chat/completions",
+            json={
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 6,
+            },
+        )
+        traces = (await client.get("/sessions/versioned/traces")).json()
+
+    assert response.status_code == 200
+    assert traces[0]["weight_version"] == 5
+    assert traces[0]["completion_token_ids"] == [10, 11, 12, 13]
+    assert traces[0]["logprobs"] == [-0.11, -0.22, -0.33, -0.44]
+    assert traces[0]["logprobs_mode"] == "processed_logprobs"
+    assert traces[0]["generator_version_spans"] == [
+        {"start": 0, "end": 2, "weight_version": 5},
+        {"start": 2, "end": 4, "weight_version": 6},
+    ]
+    assert traces[0]["metadata"]["generator_version_spans"] == [
+        {"start": 0, "end": 2, "weight_version": 5},
+        {"start": 2, "end": 4, "weight_version": 6},
+    ]
+
+
+def test_interrupted_generation_rejects_nonfinite_logprob():
+    response = _response(
+        prompt_ids=[1, 2],
+        token_ids=[10],
+        logprobs=[float("nan")],
+        finish_reason="abort",
+        text="partial",
+        chat=True,
+    )
+
+    with pytest.raises(AbortResumeError, match="non-finite"):
+        AbortedGeneration(
+            {"messages": [{"role": "user", "content": "hello"}]},
+            response,
+            decoder=lambda ids: "partial",
+            tool_parser=None,
+            weight_version=0,
+            logprobs_mode="processed_logprobs",
+        )
 
 
 @pytest.mark.asyncio

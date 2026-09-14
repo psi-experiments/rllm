@@ -183,6 +183,11 @@ class GatewayManager:
         configured_resume = gw_cfg.get("resume_aborted_requests", None)
         self.resume_aborted_requests: bool = auto_resume if configured_resume is None else bool(configured_resume)
         rollout_cfg = config.get("actor_rollout_ref", {}).get("rollout", {})
+        # vLLM's logprobs mode is a server-startup setting. Carry the resolved
+        # value into the gateway so each trace declares whether its sampled
+        # token values are the processed behavior-policy logprobs required by
+        # importance sampling. Missing stays unknown rather than being guessed.
+        self.logprobs_mode: str | None = rollout_cfg.get("logprobs_mode", None)
         vllm_engine_kwargs = rollout_cfg.get("engine_kwargs", {}).get("vllm", {})
         configured_tool_parser = gw_cfg.get("abort_resume_tool_parser", None)
         self.abort_resume_tool_parser: str | None = configured_tool_parser if configured_tool_parser is not None else vllm_engine_kwargs.get("tool_call_parser", None)
@@ -378,6 +383,8 @@ class GatewayManager:
             cmd.extend(["--model", self.model])
         if self.tokenizer_path:
             cmd.extend(["--tokenizer-path", self.tokenizer_path])
+        if self.logprobs_mode:
+            cmd.extend(["--logprobs-mode", self.logprobs_mode])
         if self.cumulative_token_mode:
             cmd.append("--cumulative-token-mode")
             if self.renderer_family != "auto":
@@ -434,6 +441,7 @@ class GatewayManager:
             model=self.model,
             tokenizer_path=self.tokenizer_path,
             add_logprobs=self.add_logprobs,
+            logprobs_mode=self.logprobs_mode,
             add_return_token_ids=self.add_return_token_ids,
             cumulative_token_mode=self.cumulative_token_mode,
             renderer_family=self.renderer_family,

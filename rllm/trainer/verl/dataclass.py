@@ -19,6 +19,9 @@ class ProcessedStepData:
     step_id: str
     multi_modal_inputs: dict = field(default_factory=dict)  # Optional multimodal inputs (e.g., image_grid_thw for Qwen-VL)
     advantage: float | list[float] | None = None
+    # Multiplier applied when a single logical trajectory is represented by
+    # multiple trainer rows.  The default preserves all existing transforms.
+    advantage_weight: float = 1.0
     logprobs: list[float] | None = None  # Per-token rollout log probs for importance sampling
     routing_matrices: torch.Tensor | None = None  # (response_len, num_layers, topk) int tensor for R3 router replay
 
@@ -60,6 +63,9 @@ class AccumulatedData:
     # Advantage data (not None if stepwise advantages are already computed)
     advantages: list[float | list[float]] = field(default_factory=list)
 
+    # Per-row objective-preserving advantage multiplier.
+    advantage_weights: list[float] = field(default_factory=list)
+
     # Per-row trajectory role name (for per-role loss routing in VerlBackend)
     group_roles: list[str] = field(default_factory=list)
 
@@ -74,6 +80,15 @@ class AccumulatedData:
     # These counters are batch-level diagnostics, not parallel per-row lists.
     context_clipped_rows: int = 0
     context_clipped_tokens: int = 0
+
+    # Qwen cumulative-chat behavior-policy log-probability alignment. These
+    # are batch diagnostics; rejection means the canonical row is still
+    # usable for ordinary trainer-side old-log-probability recomputation, but
+    # must not be used for behavior-policy importance sampling.
+    behavior_logprobs_aligned_rows: int = 0
+    behavior_logprobs_rejected_rows: int = 0
+    behavior_logprobs_rejection_reasons: dict[str, int] = field(default_factory=dict)
+    behavior_logprobs_provenance: dict[str, object] | None = None
 
     def add_step(
         self,
@@ -97,6 +112,7 @@ class AccumulatedData:
 
         if step_data.advantage is not None:  # make sure to not add None to the list
             self.advantages.append(step_data.advantage)
+        self.advantage_weights.append(step_data.advantage_weight)
 
         self.trajectory_ids.append(trajectory_id)
         self.step_nums.append(step_num)

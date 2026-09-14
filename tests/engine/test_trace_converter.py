@@ -122,6 +122,46 @@ class TestTraceRecordToStep:
         step = trace_record_to_step(self._make_trace())
         assert step.weight_version is None
 
+    def test_behavior_logprob_mode_and_version_spans_propagated(self):
+        trace = self._make_trace(
+            logprobs_mode="processed_logprobs",
+            behavior_sampling_params={
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+            },
+            generator_version_spans=[
+                {"start": 0, "end": 1, "weight_version": 7},
+                {"start": 1, "end": 2, "weight_version": 8},
+            ],
+        )
+
+        step = trace_record_to_step(trace)
+
+        expected_spans = [
+            {"start": 0, "end": 1, "weight_version": 7},
+            {"start": 1, "end": 2, "weight_version": 8},
+        ]
+        assert step.model_output.logprobs_mode == "processed_logprobs"
+        assert step.model_output.behavior_sampling_params == {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+        }
+        assert step.model_output.generator_version_spans == expected_spans
+        assert step.info["logprobs_mode"] == "processed_logprobs"
+        assert step.info["behavior_sampling_params"] == {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+        }
+        assert step.info["generator_version_spans"] == expected_spans
+
+        restored = type(step.model_output).from_dict(step.model_output.to_dict())
+        assert restored.logprobs_mode == "processed_logprobs"
+        assert restored.behavior_sampling_params == step.model_output.behavior_sampling_params
+        assert restored.generator_version_spans == expected_spans
+
     def test_step_with_tool_calls(self):
         trace = self._make_trace(
             response_message={

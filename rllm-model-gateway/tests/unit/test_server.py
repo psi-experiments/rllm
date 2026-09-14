@@ -67,6 +67,14 @@ def test_cli_config_loads_no_progress_resume_limit():
     assert config.max_consecutive_no_progress_resumes == 7
 
 
+def test_cli_config_loads_declared_logprobs_mode(monkeypatch):
+    monkeypatch.setenv("RLLM_GATEWAY_LOGPROBS_MODE", "raw_logprobs")
+
+    config = _load_config(SimpleNamespace(logprobs_mode="processed_logprobs"))
+
+    assert config.logprobs_mode == "processed_logprobs"
+
+
 # ------------------------------------------------------------------
 # Session management
 # ------------------------------------------------------------------

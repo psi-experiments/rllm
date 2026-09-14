@@ -61,6 +61,74 @@ _DEFAULT_VERL_LOSS = "vanilla"
 _VERL_KNOWN_LOSSES: set[str] | None = None
 
 
+def compute_support_aware_rollout_correction_weights(
+    log_ratio: torch.Tensor,
+    response_mask: torch.Tensor,
+    old_sampling_support_mask: torch.Tensor,
+    *,
+    rollout_is: str,
+    rollout_is_threshold: str | float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute correction weights and statistics on the actor's finite support.
+
+    A behavior token outside the proximal actor's top-k/top-p support has an
+    exact importance weight of zero. Excluding it only after VERL computes its
+    statistics makes clipping fractions and ESS describe weights that are
+    never applied. Restrict the metric mask first, while retaining an explicit
+    fraction for the excluded behavior tokens.
+    """
+
+    if log_ratio.shape != response_mask.shape or response_mask.shape != old_sampling_support_mask.shape:
+        raise ValueError(
+            "rollout correction log ratios, response mask, and old-policy support "
+            "mask must have identical shapes"
+        )
+    if rollout_is != "token":
+        raise ValueError(
+            "sampling-support-aware behavior correction currently requires "
+            "token-level importance sampling"
+        )
+
+    action_mask = response_mask.bool()
+    unsupported = action_mask & ~old_sampling_support_mask.bool()
+    denominator = action_mask.sum().clamp(min=1)
+    out_of_support_fraction = float((unsupported.sum() / denominator).item())
+    supported_response_mask = response_mask * old_sampling_support_mask.to(
+        dtype=response_mask.dtype
+    )
+
+    if not supported_response_mask.any():
+        # There is no finite π_old / π_behavior ratio in this batch. Keep the
+        # loss contribution at exactly zero and mark the ordinary weight
+        # statistics as undefined instead of asking VERL's reducer to divide
+        # by an empty mask.
+        return torch.zeros_like(log_ratio), {
+            "rollout_is_mean": 0.0,
+            "rollout_is_std": 0.0,
+            "rollout_is_eff_sample_size": 0.0,
+            "rollout_is_ratio_fraction_high": 0.0,
+            "rollout_is_ratio_fraction_low": 0.0,
+            "rollout_is_metrics_defined": 0.0,
+            "old_policy_out_of_support_fraction": out_of_support_fraction,
+        }
+
+    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_weights
+
+    rollout_is_weights, metrics = compute_rollout_correction_weights(
+        log_ratio=log_ratio,
+        response_mask=supported_response_mask,
+        rollout_is=rollout_is,
+        rollout_is_threshold=rollout_is_threshold,
+    )
+    # The helper already zeros positions outside its mask. Apply the support
+    # mask again here so this invariant stays local if the upstream helper's
+    # padding behavior changes.
+    rollout_is_weights = rollout_is_weights.masked_fill(~supported_response_mask.bool(), 0.0)
+    metrics["rollout_is_metrics_defined"] = 1.0
+    metrics["old_policy_out_of_support_fraction"] = out_of_support_fraction
+    return rollout_is_weights, metrics
+
+
 class CustomPPOLoss:
     """Wraps Verl's ``ppo_loss`` to support per-call loss mode override.
 
@@ -446,13 +514,37 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
         # and can grow up to the full context window - so use max_total_length to
         # bound the sequence.
         max_total_length = max_prompt_length + self.config.data.max_response_length
+        # Exact behavior-correction rows use each turn's actual served prompt.
+        # A later tool turn may spend nearly the entire serving context on its
+        # prompt while dynamically requesting only the small remaining output.
+        # Give those rows the full context as prompt *storage* width, while the
+        # separate max_total_length check below continues to reject (never
+        # truncate) any prompt + completion beyond the serving context.  Keep
+        # the historical storage shape for every ordinary training run.
+        behavior_logprobs_mode = self.config.actor_rollout_ref.actor.get(
+            "behavior_logprobs_mode", "temperature_only"
+        )
+        prompt_storage_length = (
+            max_total_length
+            if behavior_logprobs_mode == "processed_logprobs"
+            else max_prompt_length
+        )
+        # Exact rows contain one served model turn, so their response cannot
+        # exceed the rollout's per-turn generation cap.  Canonical merged rows
+        # still need the historical full-context response storage for
+        # interleaved actions and observations.
+        response_storage_length = (
+            self.config.data.max_response_length
+            if behavior_logprobs_mode == "processed_logprobs"
+            else max_total_length
+        )
 
         if trainer_state.episodes is not None:
             batch = transform_episodes_to_dataproto(
                 trainer_state.episodes,
                 self.rollout_engine,
-                max_prompt_length,
-                max_total_length,
+                prompt_storage_length,
+                response_storage_length,
                 max_total_length=max_total_length,
             )
             # Lift per-batch merge metrics (batch/steps_per_traj,
@@ -468,8 +560,8 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
         batch = transform_trajectory_groups_to_dataproto(
             trainer_state.trajectory_groups,
             self.rollout_engine,
-            max_prompt_length,
-            max_total_length,
+            prompt_storage_length,
+            response_storage_length,
             max_total_length=max_total_length,
         )
         merge_metrics = batch.meta_info.pop("merge_metrics", None)
@@ -625,6 +717,11 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
         # Set meta_info needed by workers
         batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        batch.meta_info["top_k"] = self.config.actor_rollout_ref.rollout.top_k
+        batch.meta_info["top_p"] = self.config.actor_rollout_ref.rollout.top_p
+        batch.meta_info["behavior_logprobs_mode"] = self.config.actor_rollout_ref.actor.get(
+            "behavior_logprobs_mode", "temperature_only"
+        )
         if "multi_modal_inputs" in batch.non_tensor_batch:
             images_seqlens_all = []
             for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
@@ -654,12 +751,24 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
                 output = self.actor_rollout_wg.compute_log_prob(batch_td)
                 log_probs = no_padding_2_padding(tu.get(output, "log_probs"), batch_td)
                 entropy = no_padding_2_padding(tu.get(output, "entropy"), batch_td)
+                sampling_support = tu.get(output, "sampling_support_mask", default=None)
+                if batch.meta_info["behavior_logprobs_mode"] == "processed_logprobs":
+                    if sampling_support is None:
+                        raise RuntimeError(
+                            "processed behavior log-probabilities require the actor "
+                            "to return sampling_support_mask"
+                        )
+                    sampling_support = no_padding_2_padding(
+                        sampling_support, batch_td
+                    ).bool()
                 routed_experts = tu.get(output, "routed_experts", default=None)
 
                 # Build the old_log_prob DataProto. Include routed_experts when verl's
                 # R2 router-replay path populated it during the proximal forward pass —
                 # the actor update reads it from the batch in megatron_actor.py.
                 old_log_prob_tensors = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
+                if sampling_support is not None:
+                    old_log_prob_tensors["old_sampling_support_mask"] = sampling_support
                 if routed_experts is not None:
                     old_log_prob_tensors["routed_experts"] = routed_experts
                 old_log_prob = DataProto.from_tensordict(tu.get_tensordict(old_log_prob_tensors))
@@ -681,12 +790,24 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
                     from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_weights
 
                     log_ratio = batch.batch["old_log_probs"] - batch.batch["rollout_log_probs"]
-                    rollout_is_weights, is_metrics = compute_rollout_correction_weights(
-                        log_ratio=log_ratio,
-                        response_mask=batch.batch["response_mask"],
-                        rollout_is=tis_mode,
-                        rollout_is_threshold=rc.tis_cap,
-                    )
+                    old_support = batch.batch.get("old_sampling_support_mask")
+                    if old_support is not None:
+                        rollout_is_weights, is_metrics = (
+                            compute_support_aware_rollout_correction_weights(
+                                log_ratio,
+                                batch.batch["response_mask"],
+                                old_support,
+                                rollout_is=tis_mode,
+                                rollout_is_threshold=rc.tis_cap,
+                            )
+                        )
+                    else:
+                        rollout_is_weights, is_metrics = compute_rollout_correction_weights(
+                            log_ratio=log_ratio,
+                            response_mask=batch.batch["response_mask"],
+                            rollout_is=tis_mode,
+                            rollout_is_threshold=rc.tis_cap,
+                        )
                     batch.batch["rollout_is_weights"] = rollout_is_weights
                     metrics.update({f"rollout_correction/{k}": v for k, v in is_metrics.items()})
 
@@ -697,18 +818,39 @@ class VerlBackend(BackendProtocol[Iterable, DataProto]):
         if has_rollout_log_probs:
             from verl.trainer.ppo.rollout_corr_helper import compute_offpolicy_metrics
 
-            offpolicy_metrics = compute_offpolicy_metrics(
-                old_log_prob=batch.batch["old_log_probs"],
-                rollout_log_prob=batch.batch["rollout_log_probs"],
-                response_mask=batch.batch["response_mask"],
-            )
-            metrics.update({f"offpolicy/{k}": v for k, v in offpolicy_metrics.items()})
+            offpolicy_response_mask = batch.batch["response_mask"]
+            old_support = batch.batch.get("old_sampling_support_mask")
+            if old_support is not None:
+                offpolicy_response_mask = offpolicy_response_mask * old_support.to(
+                    dtype=offpolicy_response_mask.dtype
+                )
+            if offpolicy_response_mask.any():
+                offpolicy_metrics = compute_offpolicy_metrics(
+                    old_log_prob=batch.batch["old_log_probs"],
+                    rollout_log_prob=batch.batch["rollout_log_probs"],
+                    response_mask=offpolicy_response_mask,
+                )
+                metrics.update({f"offpolicy/{k}": v for k, v in offpolicy_metrics.items()})
+                metrics["offpolicy/metrics_defined"] = 1.0
+            else:
+                # All sampled actions have zero probability under π_old. The
+                # correction path already gives them zero loss weight; avoid
+                # asking the diagnostic reducer to divide by an empty mask.
+                metrics["offpolicy/metrics_defined"] = 0.0
             metrics.update(calculate_debug_metrics_compat(batch))
 
         # --- Compute reference log_probs (reuse batch_td) ---
         if self.use_reference_policy:
             with simple_timer("ref", timing_dict):
-                tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False)
+                # Behavior-policy correction changes the proximal/current actor
+                # distribution only.  Keep the independent reference-policy KL
+                # on VERL's historical temperature-scaled distribution.
+                tu.assign_non_tensor(
+                    batch_td,
+                    calculate_entropy=False,
+                    compute_loss=False,
+                    behavior_logprobs_mode="temperature_only",
+                )
                 if not self.ref_in_actor:
                     ref_output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
                 else:

@@ -1,7 +1,9 @@
 import base64
 import json
 import logging
+import math
 import uuid
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -15,6 +17,420 @@ from rllm.types import Episode, Trajectory, TrajectoryGroup
 from rllm.workflows.workflow import TerminationReason
 
 logger = logging.getLogger(__name__)
+
+_BEHAVIOR_SAMPLING_FIELDS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "repetition_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+)
+_NEUTRAL_BEHAVIOR_PENALTIES = {
+    "repetition_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+}
+
+# These request fields are recorded by the model gateway because they can
+# affect sampling.  The trainer currently reproduces only temperature,
+# top-k/top-p, and neutral penalties.  Fields below are safe only at the
+# listed neutral values; everything else must fail closed before the rollout
+# log-probabilities are admitted to the loss.
+_NEUTRAL_UNSUPPORTED_SAMPLING_CONTROLS = {
+    "allowed_token_ids": (None, []),
+    "bad_words": (None, []),
+    "beam_search": (None, False),
+    "best_of": (None, 1),
+    "early_stopping": (None, False),
+    "guided_choice": (None,),
+    "guided_decoding_backend": (None,),
+    "guided_grammar": (None,),
+    "guided_json": (None,),
+    "guided_regex": (None,),
+    "ignore_eos": (None, False),
+    "length_penalty": (None, 1, 1.0),
+    "logit_bias": (None, {}),
+    "logits_processors": (None, []),
+    "min_p": (None, 0, 0.0),
+    "min_tokens": (None, 0),
+    "response_format": (None,),
+    "structured_outputs": (None, {}),
+    "typical_p": (None, 1, 1.0),
+    "use_beam_search": (None, False),
+}
+_SAFE_SAMPLING_BOOKKEEPING_FIELDS = {
+    "include_stop_str_in_output",
+    "max_tokens",
+    "parallel_tool_calls",
+    "seed",
+    "stop",
+    "stop_token_ids",
+    "truncate_prompt_tokens",
+}
+
+
+def _normalize_behavior_sampling_value(name: str, value) -> int | float:
+    """Normalize one configured or observed sampling value for comparison."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be numeric, not boolean")
+    if name == "top_k":
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        try:
+            matches_integer = float(value) == normalized
+        except (TypeError, ValueError, OverflowError):
+            matches_integer = False
+        if not matches_integer:
+            raise ValueError(f"{name} must be an integer")
+        return normalized
+
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(normalized):
+        raise ValueError(f"{name} must be finite")
+    return normalized
+
+
+def _mapping_at_path(root, *path: str) -> Mapping | None:
+    current = root
+    for key in path:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    return current if isinstance(current, Mapping) else None
+
+
+def _resolve_expected_behavior_sampling_params(rollout_engine) -> dict[str, int | float]:
+    """Resolve and cross-check the six behavior-policy sampling controls.
+
+    ``VerlEngine.train_sampling_params`` is the primary source. The full rLLM
+    train sampling config supplies controls (notably penalties) that VerlEngine
+    does not copy into that convenience mapping. Values present in both sources
+    must agree. Penalties must remain neutral until trainer recomputation gains
+    matching history-dependent logits processors.
+    """
+    engine_params = getattr(rollout_engine, "train_sampling_params", None)
+    if not isinstance(engine_params, Mapping):
+        engine_params = {}
+    config_params = _mapping_at_path(
+        getattr(rollout_engine, "config", None),
+        "rllm",
+        "rollout",
+        "train",
+    )
+    sources = (
+        ("rollout_engine.train_sampling_params", engine_params),
+        ("config.rllm.rollout.train", config_params or {}),
+    )
+
+    resolved: dict[str, int | float] = {}
+    for name in _BEHAVIOR_SAMPLING_FIELDS:
+        observed: list[tuple[str, int | float]] = []
+        for source_name, source in sources:
+            if name not in source:
+                continue
+            try:
+                value = _normalize_behavior_sampling_value(name, source[name])
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid behavior sampling configuration in {source_name}: {exc}"
+                ) from exc
+            observed.append((source_name, value))
+        if not observed:
+            raise ValueError(
+                f"behavior-logprob provenance requires configured {name}"
+            )
+        if any(value != observed[0][1] for _, value in observed[1:]):
+            details = ", ".join(
+                f"{source_name}={value!r}" for source_name, value in observed
+            )
+            raise ValueError(
+                f"behavior sampling configuration disagrees for {name}: {details}"
+            )
+        resolved[name] = observed[0][1]
+
+    for name, neutral in _NEUTRAL_BEHAVIOR_PENALTIES.items():
+        if resolved[name] != neutral:
+            raise ValueError(
+                f"behavior-logprob provenance requires neutral {name}={neutral!r}, "
+                f"got {resolved[name]!r}"
+            )
+    return resolved
+
+
+def _sampling_params_rejection_reason(
+    actual,
+    expected: Mapping[str, int | float],
+    *,
+    source: str,
+) -> str | None:
+    """Return a stable fail-closed reason for missing or mismatched controls."""
+    if not isinstance(actual, Mapping):
+        return f"missing_{source}_sampling_params"
+    for name in _BEHAVIOR_SAMPLING_FIELDS:
+        if name not in actual:
+            return f"missing_{source}_sampling_param_{name}"
+        try:
+            value = _normalize_behavior_sampling_value(name, actual[name])
+        except ValueError:
+            return f"invalid_{source}_sampling_param_{name}"
+        if value != expected[name]:
+            return f"{source}_sampling_param_mismatch_{name}"
+    for name, neutral_values in _NEUTRAL_UNSUPPORTED_SAMPLING_CONTROLS.items():
+        if name in actual and actual[name] not in neutral_values:
+            return f"unsupported_{source}_sampling_control_{name}"
+    if "n" in actual and actual["n"] != 1:
+        return f"unsupported_{source}_sampling_control_n"
+    if "tool_choice" in actual and actual["tool_choice"] not in (None, "auto"):
+        return f"unsupported_{source}_sampling_control_tool_choice"
+    known_fields = (
+        set(_BEHAVIOR_SAMPLING_FIELDS)
+        | set(_NEUTRAL_UNSUPPORTED_SAMPLING_CONTROLS)
+        | _SAFE_SAMPLING_BOOKKEEPING_FIELDS
+        | {"n", "tool_choice"}
+    )
+    unknown_fields = sorted(set(actual) - known_fields)
+    if unknown_fields:
+        return f"unsupported_{source}_sampling_control_{unknown_fields[0]}"
+    return None
+
+
+def _extract_episode_behavior_sampling_params(episode: Episode) -> Mapping | None:
+    """Return only EasySim's six distribution-defining root settings.
+
+    ``generation_config`` also contains context-budget and transcript
+    bookkeeping. Those values describe the episode but do not change token
+    probabilities. Per-step gateway traces remain authoritative for detecting
+    unsupported request controls such as ``min_p`` or guided decoding.
+    """
+    artifacts = getattr(episode, "artifacts", None)
+    if not isinstance(artifacts, Mapping):
+        return None
+    generation_config = artifacts.get("generation_config")
+    if not isinstance(generation_config, Mapping):
+        return None
+    if not any(name in generation_config for name in _BEHAVIOR_SAMPLING_FIELDS):
+        return None
+    return {
+        name: generation_config[name]
+        for name in _BEHAVIOR_SAMPLING_FIELDS
+        if name in generation_config
+    }
+
+
+def _uses_qwen_cumulative_chat(trajectories, chat_parser) -> bool:
+    if not isinstance(chat_parser, QwenChatTemplateParser):
+        return False
+    return any(
+        (trajectory.metadata or {}).get("rllm_cumulative_chat") is not None
+        for trajectory in trajectories
+    )
+
+
+def _requires_exact_processed_behavior_rows(rollout_engine) -> bool:
+    """Return whether the trainer explicitly consumes processed behavior lps.
+
+    ``rllm_cumulative_chat`` is present on ordinary EasySim trajectories too,
+    so it must not by itself change the batch representation.  The actor-side
+    behavior-logprob mode is the explicit correction contract shared with the
+    loss implementation.
+    """
+    actor_config = _mapping_at_path(
+        getattr(rollout_engine, "config", None),
+        "actor_rollout_ref",
+        "actor",
+    )
+    return (
+        isinstance(actor_config, Mapping)
+        and actor_config.get("behavior_logprobs_mode") == "processed_logprobs"
+    )
+
+
+def _validate_exact_processed_behavior_steps(
+    steps: list,
+    *,
+    expected_sampling_params: Mapping[str, int | float],
+    episode_sampling_params: Mapping | None = None,
+) -> tuple[list[list[float]] | None, str | None]:
+    """Validate exact per-turn behavior logprobs without re-rendering chat.
+
+    Each accepted row uses the prompt and completion IDs captured directly
+    from the inference request.  Unlike the cumulative-chat representation,
+    this remains exact when a chat template rewrites old tool calls, thinking
+    markers, Unicode, or JSON formatting on a later turn.
+    """
+    episode_rejection = (
+        _sampling_params_rejection_reason(
+            episode_sampling_params,
+            expected_sampling_params,
+            source="episode",
+        )
+        if episode_sampling_params is not None
+        else None
+    )
+    if episode_rejection is not None:
+        return None, episode_rejection
+
+    validated: list[list[float]] = []
+    for step in steps:
+        model_output = step.model_output
+        if getattr(model_output, "logprobs_mode", None) != "processed_logprobs":
+            return None, "logprobs_mode_not_processed"
+        sampling_rejection = _sampling_params_rejection_reason(
+            getattr(model_output, "behavior_sampling_params", None),
+            expected_sampling_params,
+            source="step",
+        )
+        if sampling_rejection is not None:
+            return None, sampling_rejection
+
+        prompt_ids = getattr(model_output, "prompt_ids", None)
+        completion_ids = getattr(model_output, "completion_ids", None)
+        logprobs = getattr(model_output, "logprobs", None)
+        if prompt_ids is None:
+            return None, "missing_prompt_tokens"
+        if completion_ids is None or len(completion_ids) == 0:
+            return None, "missing_completion_tokens"
+        if logprobs is None or len(logprobs) == 0:
+            return None, "missing_logprobs"
+        try:
+            [int(token) for token in list(prompt_ids)]
+        except (TypeError, ValueError):
+            return None, "invalid_prompt_token"
+        try:
+            completion = [int(token) for token in list(completion_ids)]
+        except (TypeError, ValueError):
+            return None, "invalid_completion_token"
+        if len(logprobs) != len(completion):
+            return None, "logprob_length_mismatch"
+        try:
+            values = [float(value) for value in logprobs]
+        except (TypeError, ValueError):
+            return None, "invalid_logprob_value"
+        if not all(math.isfinite(value) for value in values):
+            return None, "nonfinite_logprob"
+        validated.append(values)
+
+    return validated, None
+
+
+def _align_qwen_cumulative_behavior_logprobs(
+    prompt: torch.Tensor,
+    response: torch.Tensor,
+    mask: torch.Tensor,
+    steps: list,
+    *,
+    expected_sampling_params: Mapping[str, int | float],
+    episode_sampling_params: Mapping | None = None,
+) -> tuple[list[float] | None, str | None]:
+    """Align served action log-probabilities to one canonical Qwen row.
+
+    The cumulative Qwen transform re-renders structured chat messages. A
+    served log-probability is valid in that row only when the exact token
+    prefix seen by the rollout engine and the exact sampled completion both
+    occur at the expected canonical positions. This function intentionally
+    has no suffix/fuzzy alignment: a prompt mismatch changes the conditional
+    distribution, even if the completion tokens happen to match.
+
+    Non-action tokens (tool calls/results and other context) retain a 0.0
+    placeholder and are ignored by ``response_mask``. Any incomplete,
+    non-finite, overlapping, or partial alignment rejects the entire row.
+    """
+
+    episode_rejection = (
+        _sampling_params_rejection_reason(
+            episode_sampling_params,
+            expected_sampling_params,
+            source="episode",
+        )
+        if episode_sampling_params is not None
+        else None
+    )
+    if episode_rejection is not None:
+        return None, episode_rejection
+
+    prompt_ids = [int(token) for token in prompt.tolist()]
+    response_ids = [int(token) for token in response.tolist()]
+    response_mask = [int(value) for value in mask.tolist()]
+    if len(response_ids) != len(response_mask):
+        return None, "canonical_response_mask_length_mismatch"
+    if any(value not in (0, 1) for value in response_mask):
+        return None, "canonical_response_mask_not_binary"
+
+    canonical_ids = prompt_ids + response_ids
+    response_offset = len(prompt_ids)
+    aligned = [0.0] * len(response_ids)
+    covered = [False] * len(response_ids)
+
+    for step in steps:
+        model_output = step.model_output
+        if getattr(model_output, "logprobs_mode", None) != "processed_logprobs":
+            return None, "logprobs_mode_not_processed"
+        sampling_rejection = _sampling_params_rejection_reason(
+            getattr(model_output, "behavior_sampling_params", None),
+            expected_sampling_params,
+            source="step",
+        )
+        if sampling_rejection is not None:
+            return None, sampling_rejection
+        served_prompt = model_output.prompt_ids
+        served_completion = model_output.completion_ids
+        served_logprobs = model_output.logprobs
+
+        if served_prompt is None:
+            return None, "missing_prompt_tokens"
+        if served_completion is None or len(served_completion) == 0:
+            return None, "missing_completion_tokens"
+        if served_logprobs is None or len(served_logprobs) == 0:
+            return None, "missing_logprobs"
+
+        try:
+            served_prompt_ids = [int(token) for token in list(served_prompt)]
+        except (TypeError, ValueError):
+            return None, "invalid_prompt_token"
+        try:
+            served_completion_ids = [int(token) for token in list(served_completion)]
+        except (TypeError, ValueError):
+            return None, "invalid_completion_token"
+        if len(served_logprobs) != len(served_completion_ids):
+            return None, "logprob_length_mismatch"
+        try:
+            logprobs = [float(value) for value in served_logprobs]
+        except (TypeError, ValueError):
+            return None, "invalid_logprob_value"
+        if not all(math.isfinite(value) for value in logprobs):
+            return None, "nonfinite_logprob"
+
+        prompt_end = len(served_prompt_ids)
+        if prompt_end > len(canonical_ids) or canonical_ids[:prompt_end] != served_prompt_ids:
+            return None, "prompt_token_mismatch"
+
+        completion_end = prompt_end + len(served_completion_ids)
+        if completion_end > len(canonical_ids) or canonical_ids[prompt_end:completion_end] != served_completion_ids:
+            return None, "completion_token_mismatch"
+
+        action_start = prompt_end - response_offset
+        action_end = completion_end - response_offset
+        if action_start < 0 or action_end > len(response_ids):
+            return None, "completion_outside_response"
+        if any(value != 1 for value in response_mask[action_start:action_end]):
+            return None, "completion_not_fully_action_masked"
+        if any(covered[action_start:action_end]):
+            return None, "overlapping_completion_spans"
+
+        aligned[action_start:action_end] = logprobs
+        covered[action_start:action_end] = [True] * len(logprobs)
+
+    for is_action, is_covered in zip(response_mask, covered, strict=True):
+        if bool(is_action) != is_covered:
+            return None, "incomplete_action_coverage"
+
+    return aligned, None
 
 
 def _pad_sequence_batch(sequences: list[torch.Tensor], pad_token_id: int, max_length: int, left_pad: bool = True) -> torch.Tensor:
@@ -213,6 +629,9 @@ def _batch_tensors_and_build_data_proto(
         "is_pad_step": np.zeros(len(accumulated.trajectory_ids), dtype=bool),
         # Per-row trajectory role name (for per-role loss routing)
         "group_roles": np.array(accumulated.group_roles, dtype=object),
+        "advantage_weights": np.array(
+            accumulated.advantage_weights, dtype=np.float32
+        ),
     }
 
     # Include multi_modal_inputs in non_tensors if any are present
@@ -230,10 +649,23 @@ def _batch_tensors_and_build_data_proto(
         "step_rewards": step_rewards_batch,
     }
 
+    meta_info = {
+        "repeat_counts": accumulated.repeat_counts,
+    }
+
     # Include rollout log probs if available (enables importance sampling & bypass mode)
     if accumulated.rollout_logprobs and len(accumulated.rollout_logprobs) == len(accumulated.responses):
         rollout_logprobs_batch = _pad_sequence_batch(accumulated.rollout_logprobs, 0, max_response_length, left_pad=False)
         tensors["rollout_log_probs"] = rollout_logprobs_batch
+        if (
+            accumulated.behavior_logprobs_provenance is not None
+            and accumulated.behavior_logprobs_aligned_rows
+            == len(accumulated.responses)
+        ):
+            meta_info["rollout_log_probs_provenance"] = {
+                **accumulated.behavior_logprobs_provenance,
+                "rows": len(accumulated.responses),
+            }
 
     # Routed experts for R3 router replay. Each routing tensor covers
     # (prompt + response) tokens for its row (last step's routing in the
@@ -256,9 +688,7 @@ def _batch_tensors_and_build_data_proto(
     return DataProto.from_dict(
         tensors=tensors,
         non_tensors=non_tensors,
-        meta_info={
-            "repeat_counts": accumulated.repeat_counts,
-        },
+        meta_info=meta_info,
     )
 
 
@@ -281,6 +711,9 @@ def _process_trajectory(
     *,
     max_prompt_length: int | None = None,
     max_total_length: int | None = None,
+    expected_behavior_sampling_params: Mapping[str, int | float] | None = None,
+    episode_behavior_sampling_params: Mapping | None = None,
+    exact_processed_behavior_rows: bool = False,
 ) -> int:
     """Processes a trajectory and returns an AccumulatedData.
 
@@ -414,6 +847,10 @@ def _process_trajectory(
         """Use rLLM's chat masker when Qwen re-rendering breaks token prefixes."""
         if cumulative_config is None or not isinstance(chat_parser, QwenChatTemplateParser):
             return False
+        if expected_behavior_sampling_params is None:
+            raise ValueError(
+                "rllm_cumulative_chat behavior logprobs require configured sampling parameters"
+            )
         if len(valid_steps) != len(trajectory.steps) or not trajectory.is_cumulative():
             raise ValueError("rllm_cumulative_chat requires a complete cumulative message history")
 
@@ -425,6 +862,37 @@ def _process_trajectory(
         prompt, response, mask = chat_parser.tokenize_and_mask_cumulative(final_messages, tools=cumulative_config.get("tools"))
         if response.numel() == 0 or mask.sum().item() == 0:
             raise ValueError("rllm cumulative chat conversion produced no assistant tokens")
+
+        aligned_logprobs, rejection_reason = _align_qwen_cumulative_behavior_logprobs(
+            prompt,
+            response,
+            mask,
+            valid_steps,
+            expected_sampling_params=expected_behavior_sampling_params,
+            episode_sampling_params=episode_behavior_sampling_params,
+        )
+        if rejection_reason is None:
+            accumulated.behavior_logprobs_aligned_rows += 1
+            provenance = {
+                "logprobs_mode": "processed_logprobs",
+                "sampling_params": dict(expected_behavior_sampling_params),
+            }
+            if accumulated.behavior_logprobs_provenance is None:
+                accumulated.behavior_logprobs_provenance = provenance
+            elif accumulated.behavior_logprobs_provenance != provenance:
+                raise ValueError(
+                    "behavior-logprob provenance changed within one trainer batch"
+                )
+        else:
+            accumulated.behavior_logprobs_rejected_rows += 1
+            accumulated.behavior_logprobs_rejection_reasons[rejection_reason] = (
+                accumulated.behavior_logprobs_rejection_reasons.get(rejection_reason, 0) + 1
+            )
+            logger.warning(
+                "Rejecting Qwen cumulative behavior logprobs for trajectory %s: %s",
+                trajectory_id,
+                rejection_reason,
+            )
 
         if max_prompt_length is None:
             raise ValueError("rllm_cumulative_chat requires an explicit prompt-token limit")
@@ -451,6 +919,8 @@ def _process_trajectory(
             )
             response = response[:available_response_tokens]
             mask = mask[:available_response_tokens]
+            if aligned_logprobs is not None:
+                aligned_logprobs = aligned_logprobs[:available_response_tokens]
             accumulated.context_clipped_rows += 1
             accumulated.context_clipped_tokens += clipped_tokens
             if response.numel() == 0 or mask.sum().item() == 0:
@@ -465,8 +935,9 @@ def _process_trajectory(
                 step_id=trajectory.uid,
                 multi_modal_inputs={},
                 advantage=None,
-                # Re-tokenization invalidates captured per-token logprobs.
-                logprobs=None,
+                # Retain served behavior-policy logprobs only when exact
+                # prompt and completion token alignment was proven above.
+                logprobs=aligned_logprobs,
                 routing_matrices=None,
             ),
             trajectory_id=trajectory_id,
@@ -477,10 +948,108 @@ def _process_trajectory(
         )
         return True
 
+    def _emit_exact_processed_behavior_rows() -> int:
+        """Emit one exact served prompt/completion row for every model turn."""
+        if expected_behavior_sampling_params is None:
+            raise ValueError(
+                "processed behavior logprobs require configured sampling parameters"
+            )
+        if len(valid_steps) != len(trajectory.steps):
+            raise ValueError(
+                "processed behavior logprobs require a model output for every turn"
+            )
+
+        validated_logprobs, rejection_reason = (
+            _validate_exact_processed_behavior_steps(
+                valid_steps,
+                expected_sampling_params=expected_behavior_sampling_params,
+                episode_sampling_params=episode_behavior_sampling_params,
+            )
+        )
+        total_action_tokens = sum(
+            len(step.model_output.completion_ids) for step in valid_steps
+        )
+        if total_action_tokens <= 0:
+            raise ValueError(
+                "processed behavior logprobs require at least one completion token"
+            )
+        if rejection_reason is None:
+            assert validated_logprobs is not None
+            accumulated.behavior_logprobs_aligned_rows += len(valid_steps)
+            provenance = {
+                "logprobs_mode": "processed_logprobs",
+                "sampling_params": dict(expected_behavior_sampling_params),
+            }
+            if accumulated.behavior_logprobs_provenance is None:
+                accumulated.behavior_logprobs_provenance = provenance
+            elif accumulated.behavior_logprobs_provenance != provenance:
+                raise ValueError(
+                    "behavior-logprob provenance changed within one trainer batch"
+                )
+        else:
+            accumulated.behavior_logprobs_rejected_rows += len(valid_steps)
+            accumulated.behavior_logprobs_rejection_reasons[rejection_reason] = (
+                accumulated.behavior_logprobs_rejection_reasons.get(
+                    rejection_reason, 0
+                )
+                + len(valid_steps)
+            )
+            logger.warning(
+                "Rejecting exact Qwen behavior logprobs for trajectory %s (%d rows): %s",
+                trajectory_id,
+                len(valid_steps),
+                rejection_reason,
+            )
+
+        for index, step in enumerate(valid_steps):
+            output = step.model_output
+            prompt = torch.tensor(list(output.prompt_ids), dtype=torch.long)
+            response = torch.tensor(list(output.completion_ids), dtype=torch.long)
+            mask = torch.ones(response.numel(), dtype=torch.long)
+            routing = (
+                _decode_routing_matrices(step.routing_matrices)
+                if step.routing_matrices is not None
+                else None
+            )
+            accumulated.add_step(
+                step_data=ProcessedStepData(
+                    prompt=prompt,
+                    response=response,
+                    mask=mask,
+                    step_reward=traj_reward,
+                    step_id=trajectory.uid,
+                    multi_modal_inputs=output.multi_modal_inputs or {},
+                    advantage=None,
+                    # seq-mean-token-mean averages each row independently.
+                    # Weight turn rows by their action-token share so their
+                    # sum exactly equals the former one-row trajectory mean.
+                    advantage_weight=response.numel() / total_action_tokens,
+                    logprobs=(
+                        validated_logprobs[index]
+                        if validated_logprobs is not None
+                        else None
+                    ),
+                    routing_matrices=routing,
+                ),
+                trajectory_id=trajectory_id,
+                traj_reward=traj_reward,
+                step_num=len(valid_steps),
+                is_last=index == len(valid_steps) - 1,
+                group_role=name,
+            )
+        return len(valid_steps)
+
     # Qwen may happen to produce a literal token-prefix extension on some
     # turns and not others.  The opt-in contract is canonical cumulative-chat
     # tokenization, so apply it deterministically rather than only as a
     # fallback after prefix matching fails.
+    if (
+        exact_processed_behavior_rows
+        and cumulative_config is not None
+        and isinstance(chat_parser, QwenChatTemplateParser)
+    ):
+        return _emit_exact_processed_behavior_rows()
+
     if cumulative_config is not None and isinstance(chat_parser, QwenChatTemplateParser):
         if _emit_qwen_cumulative_chat():
             return 1
@@ -529,6 +1098,8 @@ def _process_episode(
     *,
     max_prompt_length: int | None = None,
     max_total_length: int | None = None,
+    expected_behavior_sampling_params: Mapping[str, int | float] | None = None,
+    exact_processed_behavior_rows: bool = False,
 ) -> int:
     """Processes an episode and returns an AccumulatedData.
 
@@ -548,6 +1119,9 @@ def _process_episode(
         print(f"Episode {episode.id} has no valid trajectories, dropping it from the batch")
         return 0
 
+    episode_behavior_sampling_params = _extract_episode_behavior_sampling_params(
+        episode
+    )
     for trajectory in episode.trajectories:
         n_steps = _process_trajectory(
             trajectory,
@@ -556,6 +1130,9 @@ def _process_episode(
             chat_parser=chat_parser,
             max_prompt_length=max_prompt_length,
             max_total_length=max_total_length,
+            expected_behavior_sampling_params=expected_behavior_sampling_params,
+            episode_behavior_sampling_params=episode_behavior_sampling_params,
+            exact_processed_behavior_rows=exact_processed_behavior_rows,
         )
         total_steps += n_steps
 
@@ -577,6 +1154,8 @@ def _process_trajectory_group(
     *,
     max_prompt_length: int | None = None,
     max_total_length: int | None = None,
+    expected_behavior_sampling_params: Mapping[str, int | float] | None = None,
+    exact_processed_behavior_rows: bool = False,
 ) -> int:
     """Processes a trajectory group and returns an AccumulatedData."""
     total_steps = 0
@@ -588,6 +1167,8 @@ def _process_trajectory_group(
             chat_parser=chat_parser,
             max_prompt_length=max_prompt_length,
             max_total_length=max_total_length,
+            expected_behavior_sampling_params=expected_behavior_sampling_params,
+            exact_processed_behavior_rows=exact_processed_behavior_rows,
         )
         total_steps += n_steps
 
@@ -645,7 +1226,7 @@ def _compute_merge_metrics(accumulated: AccumulatedData, total_agent_steps: int)
             action_token_ratios.append(float(mask.sum().item()) / n)
     total_emitted_rows = len(accumulated.responses)
 
-    return {
+    metrics = {
         "batch/steps_per_traj/mean": float(_np.mean(rows_per_traj)),
         "batch/steps_per_traj/min": int(_np.min(rows_per_traj)),
         "batch/steps_per_traj/max": int(_np.max(rows_per_traj)),
@@ -658,7 +1239,16 @@ def _compute_merge_metrics(accumulated: AccumulatedData, total_agent_steps: int)
         "batch/merge_compression_ratio": (total_agent_steps / total_emitted_rows if total_emitted_rows > 0 else 0.0),
         "batch/context_clipped_rows": int(accumulated.context_clipped_rows),
         "batch/context_clipped_tokens": int(accumulated.context_clipped_tokens),
+        "batch/behavior_logprobs_aligned_rows": int(accumulated.behavior_logprobs_aligned_rows),
+        "batch/behavior_logprobs_rejected_rows": int(accumulated.behavior_logprobs_rejected_rows),
     }
+    metrics.update(
+        {
+            f"batch/behavior_logprobs_rejected/{reason}": int(count)
+            for reason, count in sorted(accumulated.behavior_logprobs_rejection_reasons.items())
+        }
+    )
+    return metrics
 
 
 def transform_episodes_to_dataproto(
@@ -687,6 +1277,17 @@ def transform_episodes_to_dataproto(
     """
     tokenizer = rollout_engine.tokenizer
     processor = getattr(rollout_engine, "processor", None)
+    trajectories = [
+        trajectory for episode in episodes for trajectory in episode.trajectories
+    ]
+    expected_behavior_sampling_params = (
+        _resolve_expected_behavior_sampling_params(rollout_engine)
+        if _uses_qwen_cumulative_chat(trajectories, rollout_engine.chat_parser)
+        else None
+    )
+    exact_processed_behavior_rows = _requires_exact_processed_behavior_rows(
+        rollout_engine
+    )
 
     accumulated = AccumulatedData()
     total_agent_steps = 0
@@ -700,6 +1301,8 @@ def transform_episodes_to_dataproto(
             chat_parser=rollout_engine.chat_parser,
             max_prompt_length=max_prompt_length,
             max_total_length=max_total_length,
+            expected_behavior_sampling_params=expected_behavior_sampling_params,
+            exact_processed_behavior_rows=exact_processed_behavior_rows,
         )
         accumulated.repeat_counts.append(total_steps)
 
@@ -730,6 +1333,19 @@ def transform_trajectory_groups_to_dataproto(
     """
     tokenizer = rollout_engine.tokenizer
     processor = getattr(rollout_engine, "processor", None)
+    trajectories = [
+        trajectory
+        for trajectory_group in trajectory_groups
+        for trajectory in trajectory_group.trajectories
+    ]
+    expected_behavior_sampling_params = (
+        _resolve_expected_behavior_sampling_params(rollout_engine)
+        if _uses_qwen_cumulative_chat(trajectories, rollout_engine.chat_parser)
+        else None
+    )
+    exact_processed_behavior_rows = _requires_exact_processed_behavior_rows(
+        rollout_engine
+    )
 
     accumulated = AccumulatedData()
     for trajectory_group in trajectory_groups:
@@ -741,6 +1357,8 @@ def transform_trajectory_groups_to_dataproto(
             chat_parser=rollout_engine.chat_parser,
             max_prompt_length=max_prompt_length,
             max_total_length=max_total_length,
+            expected_behavior_sampling_params=expected_behavior_sampling_params,
+            exact_processed_behavior_rows=exact_processed_behavior_rows,
         )
         accumulated.repeat_counts.append(total_steps)
 
@@ -796,7 +1414,16 @@ def update_dataproto_with_advantages(batch: DataProto, container: list[Episode] 
     # _build_per_step_advantages, multiplied by response_mask which is 0
     # on observation tokens between actions — so observation tokens
     # automatically receive zero advantage in the loss.
-    advantages = [0.0 if is_pad[i] else adv_by_traj_uid.get(str(step_ids[i]), 0.0) for i in range(n_total)]
+    advantage_weights = batch.non_tensor_batch.get(
+        "advantage_weights", np.ones(n_total, dtype=np.float32)
+    )
+    advantages = [
+        0.0
+        if is_pad[i]
+        else adv_by_traj_uid.get(str(step_ids[i]), 0.0)
+        * float(advantage_weights[i])
+        for i in range(n_total)
+    ]
 
     advantage_tensor = _build_per_step_advantages(batch.batch["response_mask"], advantages)
     batch.batch["advantages"] = advantage_tensor

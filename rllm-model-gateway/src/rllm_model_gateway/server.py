@@ -225,6 +225,7 @@ def create_app(
         abort_resume_tool_parser=config.abort_resume_tool_parser,
         token_decoder=token_decoder,
         max_consecutive_no_progress_resumes=config.max_consecutive_no_progress_resumes,
+        logprobs_mode=config.logprobs_mode,
     )
     sessions = SessionManager(store)
 
@@ -501,6 +502,7 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         "RLLM_GATEWAY_LOG_LEVEL": "log_level",
         "RLLM_GATEWAY_STORE": "store_worker",
         "RLLM_GATEWAY_TOKENIZER_PATH": "tokenizer_path",
+        "RLLM_GATEWAY_LOGPROBS_MODE": "logprobs_mode",
     }
     for env_key, config_key in env_map.items():
         val = os.environ.get(env_key)
@@ -535,6 +537,8 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         data["abort_resume_tool_parser"] = args.abort_resume_tool_parser
     if getattr(args, "max_consecutive_no_progress_resumes", None) is not None:
         data["max_consecutive_no_progress_resumes"] = args.max_consecutive_no_progress_resumes
+    if getattr(args, "logprobs_mode", None) is not None:
+        data["logprobs_mode"] = args.logprobs_mode
 
     # Workers from CLI --worker flags (WorkerConfig validator auto-splits URLs)
     worker_urls = getattr(args, "worker", None) or []
@@ -563,6 +567,21 @@ def main() -> None:
     parser.add_argument("--db-path", type=str, default=None)
     parser.add_argument("--store", type=str, default=None, choices=["sqlite", "memory"])
     parser.add_argument("--log-level", type=str, default=None)
+    parser.add_argument(
+        "--logprobs-mode",
+        type=str,
+        default=None,
+        choices=[
+            "raw_logprobs",
+            "processed_logprobs",
+            "raw_logits",
+            "processed_logits",
+        ],
+        help=(
+            "Declared logprob mode of the upstream vLLM server. This is "
+            "recorded on traces so training can reject unknown or incompatible values."
+        ),
+    )
     parser.add_argument(
         "--model",
         type=str,

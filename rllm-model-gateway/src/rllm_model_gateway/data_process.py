@@ -5,14 +5,71 @@ Extracted from ``rllm/sdk/data_process.py``.  No dependency on rLLM's
 dicts and produces ``TraceRecord`` instances.
 """
 
+import copy
 import logging
 import time
 import uuid
 from typing import Any
 
-from rllm_model_gateway.models import TraceRecord
+from rllm_model_gateway.models import GeneratorVersionSpan, LogprobsMode, TraceRecord
 
 logger = logging.getLogger(__name__)
+
+
+# Request fields that can change the behavior policy's token distribution or
+# generation boundary. vLLM's ``processed_logprobs`` are measured after these
+# controls. Keeping the forwarded (middleware-mutated) values next to the
+# selected-token logprobs makes trainer/generator mismatches auditable. Missing
+# controls intentionally remain missing because their effective defaults belong
+# to the inference worker and must not be guessed by the gateway.
+_BEHAVIOR_SAMPLING_PARAM_FIELDS = frozenset(
+    {
+        "allowed_token_ids",
+        "bad_words",
+        "beam_search",
+        "best_of",
+        "early_stopping",
+        "frequency_penalty",
+        "guided_choice",
+        "guided_decoding_backend",
+        "guided_grammar",
+        "guided_json",
+        "guided_regex",
+        "ignore_eos",
+        "include_stop_str_in_output",
+        "length_penalty",
+        "logit_bias",
+        "logits_processors",
+        "max_tokens",
+        "min_p",
+        "min_tokens",
+        "n",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "repetition_penalty",
+        "response_format",
+        "seed",
+        "stop",
+        "stop_token_ids",
+        "structured_outputs",
+        "temperature",
+        "tool_choice",
+        "top_k",
+        "top_p",
+        "truncate_prompt_tokens",
+        "typical_p",
+        "use_beam_search",
+    }
+)
+
+
+def extract_behavior_sampling_params(request: dict[str, Any]) -> dict[str, Any]:
+    """Copy explicit behavior-policy controls from a forwarded request."""
+    return {
+        key: copy.deepcopy(value)
+        for key, value in request.items()
+        if key in _BEHAVIOR_SAMPLING_PARAM_FIELDS
+    }
 
 
 # ------------------------------------------------------------------
@@ -187,6 +244,8 @@ def build_trace_record(
     *,
     metadata: dict[str, Any] | None = None,
     weight_version: int | None = None,
+    logprobs_mode: LogprobsMode | None = None,
+    generator_version_spans: list[GeneratorVersionSpan] | None = None,
 ) -> TraceRecord:
     """Assemble a ``TraceRecord`` from raw request/response dicts."""
     choices = response_body.get("choices") or []
@@ -203,6 +262,16 @@ def build_trace_record(
     if response_weight_version is not None:
         weight_version = response_weight_version
 
+    completion_token_ids = extract_completion_token_ids(response_body)
+    if generator_version_spans is None and completion_token_ids:
+        generator_version_spans = [
+            GeneratorVersionSpan(
+                start=0,
+                end=len(completion_token_ids),
+                weight_version=weight_version,
+            )
+        ]
+
     return TraceRecord(
         trace_id=str(uuid.uuid4()),
         session_id=session_id,
@@ -210,8 +279,11 @@ def build_trace_record(
         messages=request_body.get("messages", []),
         prompt_token_ids=extract_prompt_token_ids(response_body),
         response_message=first_choice.get("message") or first_choice.get("delta") or {},
-        completion_token_ids=extract_completion_token_ids(response_body),
+        completion_token_ids=completion_token_ids,
         logprobs=extract_logprobs(response_body) or None,
+        logprobs_mode=logprobs_mode,
+        behavior_sampling_params=extract_behavior_sampling_params(request_body),
+        generator_version_spans=generator_version_spans or [],
         routing_matrices=extract_routing_matrices(response_body),
         finish_reason=first_choice.get("finish_reason"),
         weight_version=weight_version,
@@ -232,6 +304,7 @@ def build_trace_record_from_chunks(
     *,
     metadata: dict[str, Any] | None = None,
     weight_version: int | None = None,
+    logprobs_mode: LogprobsMode | None = None,
 ) -> TraceRecord:
     """Assemble a ``TraceRecord`` from accumulated streaming SSE chunks.
 
@@ -254,6 +327,10 @@ def build_trace_record_from_chunks(
         if i == 0:
             prompt_ids = extract_prompt_token_ids_from_chunk(chunk)
             model = chunk.get("model", model)
+
+        chunk_weight_version = extract_weight_version(chunk)
+        if chunk_weight_version is not None:
+            weight_version = chunk_weight_version
 
         delta_ids = extract_delta_token_ids(chunk)
         completion_ids.extend(delta_ids)
@@ -299,6 +376,19 @@ def build_trace_record_from_chunks(
         response_message=response_message,
         completion_token_ids=completion_ids,
         logprobs=logprobs or None,
+        logprobs_mode=logprobs_mode,
+        behavior_sampling_params=extract_behavior_sampling_params(request_body),
+        generator_version_spans=(
+            [
+                GeneratorVersionSpan(
+                    start=0,
+                    end=len(completion_ids),
+                    weight_version=weight_version,
+                )
+            ]
+            if completion_ids
+            else []
+        ),
         finish_reason=finish_reason,
         weight_version=weight_version,
         latency_ms=latency_ms,
